@@ -43,7 +43,16 @@ import type {
 } from '../config/profile-schema';
 import { effectiveLarkCliIdentity } from '../config/profile-schema';
 import { resolveAppPaths } from '../config/app-paths';
-import { accessToClaudePermissionMode } from '../config/permissions';
+import {
+  accessToClaudePermissionMode,
+  clampAccess,
+  claudePermissionFitsAccess,
+  CLAUDE_PERMISSION_MODES,
+  elevateAccessForClaudePermissionMode,
+  resolveClaudePermissionMode,
+  type AccessMode,
+  type ClaudePermissionMode,
+} from '../config/permissions';
 import {
   canRunAdminCommand,
   canUseDm,
@@ -178,6 +187,7 @@ const handlers: Record<string, Handler> = {
   '/config': handleConfig,
   '/stop': handleStop,
   '/timeout': handleTimeout,
+  '/mode': handleMode,
   '/ps': handlePs,
   '/exit': handleExit,
   '/doctor': handleDoctor,
@@ -204,6 +214,9 @@ const ADMIN_COMMANDS = new Set([
   '/ws',
   '/invite',
   '/remove',
+  // Changing how the agent approves its own tool calls is a security-relevant
+  // setting — owner/admin only, same as the rest of the config surface.
+  '/mode',
   // Joining a meeting makes the bot visible to every participant and exposes
   // meeting content to the agent — owner/admin only.
   '/meeting',
@@ -759,6 +772,24 @@ function selectedResumeCwd(ctx: CommandContext): string | undefined {
   return effectiveWorkspaceCwd(ctx);
 }
 
+/**
+ * The access tier a Claude profile actually runs at. Goes through the same
+ * elevation as the run policy so `/status` and `/mode` can never disagree with
+ * what the next run will do.
+ */
+function effectiveClaudeAccess(profileConfig: ProfileConfig): AccessMode {
+  const capabilityMax = claudeCapability(profileConfig).permissions.maxAccess;
+  return elevateAccessForClaudePermissionMode(
+    clampAccess(
+      profileConfig.permissions.defaultAccess,
+      profileConfig.permissions.maxAccess,
+      capabilityMax,
+    ),
+    profileConfig.permissions,
+    capabilityMax,
+  );
+}
+
 function runtimeAccessStatus(
   profileConfig: ProfileConfig,
 ): { label: string; value: string } {
@@ -766,7 +797,7 @@ function runtimeAccessStatus(
     return {
       label: 'permission',
       value: accessToClaudePermissionMode(
-        profileConfig.permissions.defaultAccess,
+        effectiveClaudeAccess(profileConfig),
         profileConfig.permissions,
       ),
     };
@@ -931,6 +962,114 @@ async function handleTimeout(args: string, ctx: CommandContext): Promise<void> {
   ctx.sessions.setIdleTimeoutMinutes(scope, n);
   log.info('command', 'timeout-set', { scope, minutes: n, targeted: parsed.targeted });
   await reply(ctx, `✅ 当前 session 探活已设为 ${n} 分钟。`);
+}
+
+/**
+ * Claude's permission mode, readable and switchable from the chat.
+ *
+ * The mode is read per run from `profileConfig.permissions`, so a change here
+ * applies to the next run without a restart — unlike `askHuman`, which is
+ * resolved once at startChannel time (it decides whether the human-in-the-loop
+ * surface gets installed at all).
+ */
+const CLAUDE_PERMISSION_MODE_HELP: Record<ClaudePermissionMode, string> = {
+  default: '每次操作都问',
+  acceptEdits: '自动放行文件编辑，其他仍然要问',
+  plan: '只读规划，不执行改动',
+  auto: '分类器逐条判断，常规操作自动放行',
+  bypassPermissions: '完全不检查权限',
+};
+
+async function handleMode(args: string, ctx: CommandContext): Promise<void> {
+  // Keep the raw argument for the error text; resolve through the
+  // case-insensitive lookup so `acceptEdits` / `bypassPermissions` survive
+  // whatever case the user typed.
+  const raw = args.trim();
+  const profileConfig = ctx.controls.profileConfig;
+
+  if (profileConfig.agentKind !== 'claude') {
+    await reply(
+      ctx,
+      `❌ \`/mode\` 只适用于 Claude profile；当前 agent 是 ${profileConfig.agentKind}。`,
+    );
+    return;
+  }
+
+  const permissions = profileConfig.permissions;
+  const access = effectiveClaudeAccess(profileConfig);
+  const pinned = permissions.claude?.permissionMode;
+  const effective = accessToClaudePermissionMode(access, permissions);
+  const askHuman = permissions.claude?.askHuman === true;
+
+  if (!raw) {
+    const lines = [
+      `⚙️ 当前 Claude 权限模式:\`${effective}\`（${CLAUDE_PERMISSION_MODE_HELP[effective]}）`,
+      pinned
+        ? `来源:\`permissions.claude.permissionMode\` 固定为 \`${pinned}\``
+        : `来源:由 access 档位推导（\`${access}\`），未固定`,
+      `人机确认（askHuman）:${askHuman ? '开' : '关'}`,
+      '',
+      '可用模式:',
+      ...CLAUDE_PERMISSION_MODES.map(
+        (mode) =>
+          `- \`${mode}\` — ${CLAUDE_PERMISSION_MODE_HELP[mode]}${
+            claudePermissionFitsAccess(mode, permissions.maxAccess) ? '' : '（超出 maxAccess，不可选）'
+          }`,
+      ),
+      '',
+      '用法:',
+      '- `/mode <模式>` 固定为该模式',
+      '- `/mode reset` 清除固定，回退到 access 档位推导',
+      '',
+      '_模式在每次 run 开始时读取，改完下一条消息即生效；`askHuman` 需要重启 bridge 才生效。_',
+    ];
+    await reply(ctx, lines.join('\n'));
+    return;
+  }
+
+  const lowered = raw.toLowerCase();
+  if (lowered === 'reset' || lowered === 'clear') {
+    if (!pinned) {
+      await reply(ctx, `当前没有固定模式，本来就跟 access 档位推导（\`${effective}\`）。`);
+      return;
+    }
+    await configOps.saveClaudePermissionMode(ctx.controls, undefined);
+    log.info('command', 'mode-reset', { profile: ctx.controls.profile, previous: pinned });
+    await reply(ctx, `✅ 已清除固定模式，回退到 access 档位推导:\`${effective}\`。`);
+    return;
+  }
+
+  const value = resolveClaudePermissionMode(raw);
+  if (!value) {
+    await reply(
+      ctx,
+      `❌ 未知模式 \`${raw}\`。可选:${CLAUDE_PERMISSION_MODES.map((m) => `\`${m}\``).join(' / ')}`,
+    );
+    return;
+  }
+
+  if (!claudePermissionFitsAccess(value, permissions.maxAccess)) {
+    await reply(
+      ctx,
+      `❌ \`${value}\` 超出当前 maxAccess（\`${permissions.maxAccess}\`）。` +
+        (value === 'auto'
+          ? '`auto` 会放行推送、建 PR 等操作，归在 `full` 档；先把 maxAccess 调成 `full`。'
+          : '先在 `/config` 或配置文件里放宽 maxAccess。'),
+    );
+    return;
+  }
+
+  if (pinned === value) {
+    await reply(ctx, `已经是 \`${value}\` 了。`);
+    return;
+  }
+
+  await configOps.saveClaudePermissionMode(ctx.controls, value);
+  log.info('command', 'mode-set', { profile: ctx.controls.profile, mode: value, previous: pinned });
+  await reply(
+    ctx,
+    `✅ Claude 权限模式已固定为 \`${value}\`（${CLAUDE_PERMISSION_MODE_HELP[value]}），下一条消息起生效。`,
+  );
 }
 
 function parseTimeoutTarget(input: string, currentScope: string): {

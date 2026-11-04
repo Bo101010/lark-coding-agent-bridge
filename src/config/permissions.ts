@@ -1,12 +1,31 @@
 export type AccessMode = 'read-only' | 'workspace' | 'full';
 export type CodexSandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
-export type ClaudePermissionMode = 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan';
+export type ClaudePermissionMode =
+  | 'default'
+  | 'acceptEdits'
+  | 'plan'
+  | 'auto'
+  | 'bypassPermissions';
 
 export interface PermissionConfig {
   defaultAccess: AccessMode;
   maxAccess: AccessMode;
   claude?: {
+    /**
+     * Pin Claude's own `--permission-mode` instead of deriving it from
+     * `defaultAccess`. Only accepted when the mode does not exceed
+     * `maxAccess` — see `CLAUDE_PERMISSION_ACCESS`.
+     */
     permissionMode?: ClaudePermissionMode;
+    /**
+     * Ask a human in Lark whenever the agent needs permission, instead of
+     * letting the CLI decide on its own.
+     *
+     * Opt-in because it is a real behavior change: a `workspace` run that
+     * used to sail through on `acceptEdits` will instead park on a card and
+     * wait — with no deadline — until someone answers or sends `/stop`.
+     */
+    askHuman?: boolean;
   };
 }
 
@@ -30,10 +49,23 @@ const ACCESS_ORDER: Record<AccessMode, number> = {
   full: 2,
 };
 
+/** Every accepted `permissions.claude.permissionMode`, weakest first. */
+export const CLAUDE_PERMISSION_MODES: readonly ClaudePermissionMode[] = [
+  'plan',
+  'default',
+  'acceptEdits',
+  'auto',
+  'bypassPermissions',
+];
+
 const CLAUDE_PERMISSION_ACCESS: Record<ClaudePermissionMode, AccessMode> = {
   plan: 'read-only',
   default: 'workspace',
   acceptEdits: 'workspace',
+  // Classifier-gated automation: `auto` approves well beyond edits — pushes to
+  // any branch, PR creation — so it belongs to the `full` tier. Mapping it to
+  // `workspace` would hand a workspace profile the ability to push.
+  auto: 'full',
   bypassPermissions: 'full',
 };
 
@@ -116,15 +148,59 @@ export function accessToClaudePermissionMode(
     return override;
   }
 
-  return accessToDefaultClaudePermissionMode(access);
+  return accessToDefaultClaudePermissionMode(access, permissions);
 }
 
-function accessToDefaultClaudePermissionMode(access: AccessMode): ClaudePermissionMode {
+/**
+ * Raise `access` to the tier implied by a pinned permission mode, when the pin
+ * is one this profile is allowed to run.
+ *
+ * `permissionMode` is validated against `maxAccess` — both at config-load time
+ * (`assertClaudePermissionWithinAccess`) and by `/mode` — so it has to be
+ * honoured even when `defaultAccess` sits lower. Without this,
+ * `defaultAccess: workspace` + `maxAccess: full` + `permissionMode: auto`
+ * validates, saves, and then silently runs as `default`, because the
+ * `accessToClaudePermissionMode` guard compares against the *derived* access.
+ * Pinning is the operator saying "this profile runs at this mode"; `maxAccess`
+ * is the budget that authorises it.
+ *
+ * Pass the already-clamped access (see {@link clampAccess}) so the agent
+ * capability ceiling still wins when it is the lower of the two.
+ */
+export function elevateAccessForClaudePermissionMode(
+  access: AccessMode,
+  permissions: PermissionConfig | undefined,
+  capabilityMax: AccessMode,
+): AccessMode {
+  const override = permissions?.claude?.permissionMode;
+  if (!override || !permissions) {
+    return access;
+  }
+
+  const maxAllowed =
+    ACCESS_ORDER[permissions.maxAccess] < ACCESS_ORDER[capabilityMax]
+      ? permissions.maxAccess
+      : capabilityMax;
+  if (!claudePermissionFitsAccess(override, maxAllowed)) {
+    return access;
+  }
+
+  const pinned = CLAUDE_PERMISSION_ACCESS[override];
+  return ACCESS_ORDER[pinned] > ACCESS_ORDER[access] ? pinned : access;
+}
+
+function accessToDefaultClaudePermissionMode(
+  access: AccessMode,
+  permissions?: PermissionConfig,
+): ClaudePermissionMode {
   switch (access) {
     case 'read-only':
       return 'plan';
     case 'workspace':
-      return 'acceptEdits';
+      // `acceptEdits` auto-approves edits and never prompts. When the
+      // profile asks for human-in-the-loop approval, `default` is what
+      // actually raises the prompts we forward to Lark as cards.
+      return permissions?.claude?.askHuman ? 'default' : 'acceptEdits';
     case 'full':
       return 'bypassPermissions';
   }
@@ -184,9 +260,17 @@ function assertClaudePermissionWithinAccess(
   permissionMode: ClaudePermissionMode,
   maxAccess: AccessMode,
 ): void {
-  if (ACCESS_ORDER[CLAUDE_PERMISSION_ACCESS[permissionMode]] > ACCESS_ORDER[maxAccess]) {
+  if (!claudePermissionFitsAccess(permissionMode, maxAccess)) {
     throw new Error('permission claude.permissionMode cannot exceed maxAccess');
   }
+}
+
+/** True iff `mode` is allowed to be pinned under `maxAccess`. */
+export function claudePermissionFitsAccess(
+  mode: ClaudePermissionMode,
+  maxAccess: AccessMode,
+): boolean {
+  return ACCESS_ORDER[CLAUDE_PERMISSION_ACCESS[mode]] <= ACCESS_ORDER[maxAccess];
 }
 
 function normalizeLegacySandboxPermissions(
@@ -217,15 +301,25 @@ function normalizeClaudePermissions(
   if (!isConfigObject(input)) {
     throw new Error('invalid permission claude config');
   }
+  const askHuman = readAskHuman(input.askHuman);
   if (input.permissionMode === undefined) {
-    return undefined;
+    return askHuman === undefined ? undefined : { askHuman };
   }
   if (!isClaudePermissionMode(input.permissionMode)) {
     throw new Error('invalid permission claude.permissionMode');
   }
   return {
     permissionMode: input.permissionMode,
+    ...(askHuman === undefined ? {} : { askHuman }),
   };
+}
+
+function readAskHuman(value: unknown): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'boolean') {
+    throw new Error('invalid permission claude.askHuman');
+  }
+  return value;
 }
 
 function hasLegacySandbox(input: Partial<LegacySandboxInput> | undefined): boolean {
@@ -275,11 +369,24 @@ function isCodexSandboxMode(value: unknown): value is CodexSandboxMode {
   return value === 'read-only' || value === 'workspace-write' || value === 'danger-full-access';
 }
 
-function isClaudePermissionMode(value: unknown): value is ClaudePermissionMode {
+export function isClaudePermissionMode(value: unknown): value is ClaudePermissionMode {
   return (
     value === 'default' ||
     value === 'acceptEdits' ||
-    value === 'bypassPermissions' ||
-    value === 'plan'
+    value === 'plan' ||
+    value === 'auto' ||
+    value === 'bypassPermissions'
   );
+}
+
+/**
+ * Case-insensitive lookup for a mode typed by a human, returning the canonical
+ * spelling. Two of the five modes are camelCase (`acceptEdits`,
+ * `bypassPermissions`), so a chat argument that was lowercased for convenience
+ * never compares equal to them — callers must resolve through here rather than
+ * matching the raw input.
+ */
+export function resolveClaudePermissionMode(value: string): ClaudePermissionMode | undefined {
+  const needle = value.trim().toLowerCase();
+  return CLAUDE_PERMISSION_MODES.find((mode) => mode.toLowerCase() === needle);
 }

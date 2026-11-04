@@ -33,6 +33,57 @@ npm i -g lark-channel-bridge
 pnpm add -g lark-channel-bridge
 ```
 
+## Local install (from source)
+
+Use this when you are working on the bridge itself, or you want a build that is not on npm yet.
+
+```bash
+git clone <repo> lark-coding-agent-bridge
+cd lark-coding-agent-bridge
+pnpm install
+pnpm build                                        # tsup → dist/cli.js
+npm i -g --install-links .
+```
+
+`--install-links` **copies** the package into the global tree instead of symlinking it. A plain `npm link` (or `pnpm link`) points the global command straight at your checkout: a half-finished edit goes live the moment you save it, and moving or deleting the checkout breaks the global command. The copy is stable, and the trade-off is that **it does not follow your edits** — after changing anything under `src/`, run `pnpm build` and re-run the install command.
+
+Verify:
+
+```bash
+lark-channel-bridge --version                  # 0.7.1-fork-0
+ls -ld "$(npm root -g)/lark-channel-bridge"    # a real directory, not a symlink
+```
+
+Then restart the daemon. A running daemon keeps the bundle it booted with, so new code only takes effect after:
+
+```bash
+lark-channel-bridge restart --profile <name>
+```
+
+### Turning on human-in-the-loop
+
+The config is the same as for the published package — the section **Ask a human for permission** below covers the full behavior. Two things trip people up:
+
+- **There is no command for it.** `permissions.claude.askHuman` can only be set by hand-editing `~/.lark-channel/config.json`, under the profile you are actually running:
+
+  ```json
+  {
+    "profiles": {
+      "claude": {
+        "permissions": {
+          "defaultAccess": "workspace",
+          "maxAccess": "workspace",
+          "claude": { "askHuman": true }
+        }
+      }
+    }
+  }
+  ```
+
+- **It only does anything at `workspace` access.** At `full` Claude runs `bypassPermissions` and never asks; at `read-only` it runs `plan`. `askHuman` flips the `workspace` mapping from `acceptEdits` — which auto-approves edits and never prompts — to `default`, which is what raises the prompts the bridge renders as cards. With `full` you can set the flag and still never see a card. The escape hatch is `/mode`: the surface itself is installed whenever `askHuman` is on, whatever the mode, so pinning a mode that *does* ask — `auto`, say — brings the cards back without changing the access level.
+
+To confirm it took effect, look at the `run started` log line: it should read `permissionMode: "default"`. If it reads `acceptEdits`, the key is missing or misspelled — every tool is being auto-approved and no card will ever appear.
+
 ## First run
 
 ```bash
@@ -153,6 +204,7 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | `/remove user @name`, `/remove admin @name`, `/remove group` | Remove access entries |
 | `/stop` | Stop the current run, including the card stop button |
 | `/timeout [N\|off\|default]` | Set or clear the current session idle watchdog |
+| `/mode [<mode>\|reset]` | Show or switch Claude's permission mode (admin) |
 | `/ps` | List local bridge processes |
 | `/exit <id\|#>` | Stop a bridge process |
 | `/reconnect` | Force a WebSocket reconnect |
@@ -217,6 +269,84 @@ Mode mapping:
 | `read-only` | `plan` | `read-only` |
 
 The legacy `sandbox` field is still readable for old configs. After the bridge saves the profile, it migrates that setting to canonical `permissions`.
+
+### Pinning Claude's permission mode
+
+`permissions.claude.permissionMode` sets Claude's `--permission-mode` directly and overrides the mapping above:
+
+| Value | Behavior |
+|---|---|
+| `default` | Ask before every operation (also spelled `manual` in Claude Code) |
+| `acceptEdits` | Auto-approve file edits; everything else still asks |
+| `plan` | Read-only planning; nothing is executed |
+| `auto` | A classifier model reviews each action: routine work is auto-approved, actions beyond what you asked — or that look driven by hostile content — are stopped |
+| `bypassPermissions` | Skip permission checks entirely |
+
+The gate is `maxAccess`, not `defaultAccess` — the pin is the operator saying "this profile runs at this mode", and `maxAccess` is the budget that authorises it. `auto` approves well beyond edits — pushes, PR creation — so it sits in the `full` tier: pinning it while `maxAccess` is `workspace` fails with `permission claude.permissionMode cannot exceed maxAccess`.
+
+```json
+{
+  "permissions": {
+    "defaultAccess": "full",
+    "maxAccess": "full",
+    "claude": { "permissionMode": "auto" }
+  }
+}
+```
+
+A pin therefore outranks a lower `defaultAccess` — `defaultAccess` is only the fallback used when nothing is pinned:
+
+```json
+{
+  "permissions": {
+    "defaultAccess": "workspace",
+    "maxAccess": "full",
+    "claude": { "permissionMode": "auto" }
+  }
+}
+```
+
+This profile runs at `auto`. `defaultAccess` only matters again once you `/mode reset` — then the derived mode comes back, and it would be `acceptEdits` here.
+
+`auto` and `askHuman` compose: the classifier clears the routine calls on its own, and anything it refuses to auto-approve still comes to you as a card (verified — a rule that forces a prompt still parks the run in `auto` mode).
+
+### Switching the mode from the chat
+
+Hand-editing the config is not the only way. `/mode` reads and writes the same key:
+
+| Command | Effect |
+|---|---|
+| `/mode` | Show the effective mode, where it comes from, and which values the access level allows |
+| `/mode <value>` | Pin `permissions.claude.permissionMode` to that value |
+| `/mode reset` | Drop the pin and go back to deriving the mode from the access level |
+
+Admin-only, like the rest of the config surface. Unlike `askHuman` — which is resolved once when the bridge starts, because it decides whether the human-in-the-loop surface gets installed at all — the mode is read at the start of every run, so a change applies to the very next message with no restart.
+
+Values the access level rules out are rejected with the reason rather than written: `/mode auto` under a `workspace` profile tells you to raise `maxAccess` first.
+
+## Ask a human for permission
+
+Set `permissions.claude.askHuman` to let the agent ask *you* in Lark whenever it needs permission, instead of deciding on its own. The bridge sends a card with 允许一次 / 始终允许 / 拒绝 and the run waits for your answer.
+
+```json
+{
+  "permissions": {
+    "defaultAccess": "workspace",
+    "maxAccess": "workspace",
+    "claude": { "askHuman": true }
+  }
+}
+```
+
+It is off by default because it changes how runs behave: with `workspace` access the bridge switches Claude from `acceptEdits` to `default` mode, so edits that used to be auto-approved now stop and ask.
+
+- **允许一次** approves only this call.
+- **始终允许** also saves a rule, which Claude Code writes into the project's `.claude/settings.local.json`. The bridge never edits that file itself — it passes the decision to the CLI, which owns the rule format.
+- **拒绝** declines the call and lets the agent continue.
+
+**There is no timeout.** A question waits indefinitely, so stepping away never costs you a run. The trade-off is that a parked run holds its conversation until you answer or send `/stop`. While waiting it gives up its concurrency slot, so other chats keep running normally. Messages sent to a parked conversation are queued, and the bridge replies once to say what it is waiting for.
+
+The same channel carries every blocking question the CLI raises, not just tool permissions. The bridge declares which dialog kinds it can render during the handshake; anything it cannot render is never sent, and that flow falls back to the CLI's own no-dialog behavior.
 
 ## Data directories
 
@@ -322,6 +452,8 @@ pnpm build
 ```
 
 `pnpm test` includes unit, integration, and process-level adapter tests. CI runs on macOS, Ubuntu, and Windows with `pnpm install --frozen-lockfile`, `pnpm test`, `pnpm typecheck`, and `pnpm build`.
+
+The suite reads the same whether you launch it from a terminal or from inside a bridge-spawned agent session: `tests/setup/scrub-bridge-env.ts` deletes the env vars the running bridge injects into its agent children (`LARK_CHANNEL*`, `LARKSUITE_CLI_CONFIG_DIR`, `CLAUDE_CODE_USER_DIALOG_TIMEOUT_MS`) before any test runs. Without it those leak into child processes and change results — `LARK_CHANNEL_PROFILE` alone redirects secret resolution to a profile that only exists on your machine. Keep it; tests that need any of these set their own values.
 
 ## Optional telemetry
 

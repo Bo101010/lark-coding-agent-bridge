@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { claudeCapability, codexCapability } from '../../../src/agent/capability';
-import type { AccessMode } from '../../../src/config/permissions';
+import type { AccessMode, ClaudePermissionMode } from '../../../src/config/permissions';
 import { createDefaultProfileConfig, type ProfileConfig } from '../../../src/config/profile-schema';
 import {
   evaluateRunPolicy,
@@ -61,6 +61,50 @@ describe('run policy', () => {
       expect(result.permissionMode).toBe(permissionMode);
     },
   );
+
+  it.each([
+    ['auto', 'full'],
+    ['bypassPermissions', 'full'],
+    ['acceptEdits', 'workspace'],
+  ] as const)(
+    'honours a pinned %s mode under a lower defaultAccess',
+    (permissionMode, expectedAccess) => {
+      // The pin is validated against maxAccess, so it has to survive a lower
+      // defaultAccess — otherwise the config saves and then runs as something
+      // else (workspace + askHuman would silently resolve to `default`).
+      const result = evaluateRunPolicy(
+        baseInput({
+          profileConfig: profile({
+            permissions: {
+              defaultAccess: 'workspace',
+              maxAccess: 'full',
+              claude: { permissionMode },
+            },
+          }),
+        }),
+      );
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error('expected run policy to allow');
+      expect(result.permissionMode).toBe(permissionMode);
+      expect(result.accessMode).toBe(expectedAccess);
+    },
+  );
+
+  it('keeps the derived mode when no mode is pinned', () => {
+    const result = evaluateRunPolicy(
+      baseInput({
+        profileConfig: profile({
+          permissions: { defaultAccess: 'workspace', maxAccess: 'full' },
+        }),
+      }),
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('expected run policy to allow');
+    expect(result.permissionMode).toBe('acceptEdits');
+    expect(result.accessMode).toBe('workspace');
+  });
 
   it('does not raise access above capability maxAccess', () => {
     const result = evaluateRunPolicy({
@@ -179,6 +223,7 @@ function profile(options: {
   permissions?: {
     defaultAccess: AccessMode;
     maxAccess: AccessMode;
+    claude?: { permissionMode?: ClaudePermissionMode; askHuman?: boolean };
   };
   attachments?: Partial<ProfileConfig['attachments']>;
 } = {}) {

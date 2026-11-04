@@ -33,6 +33,57 @@ npm i -g lark-channel-bridge
 pnpm add -g lark-channel-bridge
 ```
 
+## 本地安装（从源码）
+
+改 bridge 本身、或者想用还没发到 npm 的构建时，用这种方式：
+
+```bash
+git clone <repo> lark-coding-agent-bridge
+cd lark-coding-agent-bridge
+pnpm install
+pnpm build                                        # tsup → dist/cli.js
+npm i -g --install-links .
+```
+
+`--install-links` 会把整个包**复制**进全局目录，而不是建软链。直接 `npm link`（或 `pnpm link`）是把全局命令指回你的工作目录：改到一半的代码一存盘就生效，工作目录一挪走全局命令就废。复制版是稳定的，代价是**它不跟随你的改动**——改完 `src/` 下的任何东西，都要重新 `pnpm build` 再跑一次安装命令。
+
+验证：
+
+```bash
+lark-channel-bridge --version                  # 0.7.1-fork-0
+ls -ld "$(npm root -g)/lark-channel-bridge"    # 是真目录，不是软链
+```
+
+然后重启 daemon。跑着的 daemon 一直用它启动时加载的那份 bundle，新代码只有重启后才生效：
+
+```bash
+lark-channel-bridge restart --profile <name>
+```
+
+### 开启 human-in-the-loop
+
+配置和装 npm 版完全一样，完整行为见下面的 **让 agent 问你要权限** 一节。这里只说两个最容易踩的点：
+
+- **没有命令可以设置它。** `permissions.claude.askHuman` 只能手改 `~/.lark-channel/config.json`，而且必须改在**实际在跑的那个 profile** 下：
+
+  ```json
+  {
+    "profiles": {
+      "claude": {
+        "permissions": {
+          "defaultAccess": "workspace",
+          "maxAccess": "workspace",
+          "claude": { "askHuman": true }
+        }
+      }
+    }
+  }
+  ```
+
+- **只有在 `workspace` 下才有作用。** `full` 走的是 `bypassPermissions`，永远不问；`read-only` 走 `plan`。`askHuman` 做的事是把 `workspace` 的映射从 `acceptEdits`（自动放行编辑、从不提问）改成 `default`，而 `default` 才是会弹出卡片的那档。如果 access 是 `full`，这个开关打开也不会有任何卡片。想绕过这条，用 `/mode`：只要 `askHuman` 开着，这套人机确认界面就会装上，跟模式无关；固定成一个确实会提问的模式（比如 `auto`）就能把卡片找回来，不用动 access 档位。
+
+确认生效的办法：看 `run started` 日志里的 `permissionMode` 字段，应该是 `"default"`。如果是 `acceptEdits`，说明这个 key 没写或拼错了——所有工具都在自动放行，卡片一张也不会出现。
+
 ## 首次启动
 
 ```bash
@@ -153,6 +204,7 @@ lark-channel-bridge profile export <name> --include-secrets --yes
 | `/remove user @某人`, `/remove admin @某人`, `/remove group` | 移除访问控制条目 |
 | `/stop` | 停止当前 run，也可点卡片停止按钮 |
 | `/timeout [N\|off\|default]` | 设置或清除当前会话的 idle watchdog |
+| `/mode [<模式>\|reset]` | 查看 / 切换 Claude 权限模式（管理员） |
 | `/ps` | 列出本机 bridge 进程 |
 | `/exit <id\|#>` | 停止指定 bridge 进程 |
 | `/reconnect` | 强制 WebSocket 重连 |
@@ -217,6 +269,84 @@ bridge 会检查所选目录存在、是目录，并且不是 `/`、Home 根、�
 | `read-only` | `plan` | `read-only` |
 
 旧版 `sandbox` 字段仍可读取。bridge 保存 profile 后，会把该设置迁移为 canonical `permissions`。
+
+### 固定 Claude 的权限模式
+
+`permissions.claude.permissionMode` 直接指定 Claude 的 `--permission-mode`，覆盖上面的映射：
+
+| 值 | 行为 |
+|---|---|
+| `default` | 每次操作都问（Claude Code 里也叫 `manual`） |
+| `acceptEdits` | 自动放行文件编辑，其他仍然要问 |
+| `plan` | 只读规划，不执行任何改动 |
+| `auto` | 由分类器模型逐条判断：常规操作自动放行，超出你要求范围、或像被注入内容驱动的操作会被拦下 |
+| `bypassPermissions` | 完全不检查权限 |
+
+这个值的上限是 **`maxAccess`，不是 `defaultAccess`** —— 固定模式是运维在说「这个 profile 就跑这个模式」，`maxAccess` 是授权它的预算。`auto` 的放行范围远超文件编辑——包括推送、建 PR——所以它归在 `full` 档：`maxAccess` 还是 `workspace` 时固定它会报 `permission claude.permissionMode cannot exceed maxAccess`。
+
+```json
+{
+  "permissions": {
+    "defaultAccess": "full",
+    "maxAccess": "full",
+    "claude": { "permissionMode": "auto" }
+  }
+}
+```
+
+所以固定模式的优先级高于更低的 `defaultAccess` —— `defaultAccess` 只在没有固定模式时才作为兜底：
+
+```json
+{
+  "permissions": {
+    "defaultAccess": "workspace",
+    "maxAccess": "full",
+    "claude": { "permissionMode": "auto" }
+  }
+}
+```
+
+这个 profile 实际跑 `auto`。`defaultAccess` 只有在 `/mode reset` 之后才重新起作用——那时会回到推导出来的模式，这里是 `acceptEdits`。
+
+`auto` 和 `askHuman` 可以叠加：分类器自己放行常规调用，它不肯放行的那些照样落成卡片问你（已实测——强制触发提示的规则在 `auto` 模式下依然会把 run 停下来）。
+
+### 在对话里切换模式
+
+不一定要手改配置。`/mode` 读写的就是同一个 key：
+
+| 命令 | 作用 |
+|---|---|
+| `/mode` | 显示当前生效的模式、它从哪来，以及当前 access 档位允许选哪些 |
+| `/mode <值>` | 把 `permissions.claude.permissionMode` 固定为该值 |
+| `/mode reset` | 清除固定，回退到由 access 档位推导 |
+
+管理员命令，和其他配置类命令一致。和 `askHuman` 不同——后者在 bridge 启动时解析一次，因为它决定要不要装 human-in-the-loop 这套东西——模式是**每次 run 开始时**读取的，所以改完下一条消息就生效，不用重启。
+
+超出 access 档位的值会被直接拒绝并说明原因，而不是写进去：`workspace` profile 下执行 `/mode auto` 会提示你先放宽 `maxAccess`。
+
+## 让 agent 问你要权限
+
+把 `permissions.claude.askHuman` 打开，agent 需要权限时就会在飞书里问你，而不是自己决定。bridge 会发一张带「允许一次 / 始终允许 / 拒绝」的卡片，run 停下来等你选。
+
+```json
+{
+  "permissions": {
+    "defaultAccess": "workspace",
+    "maxAccess": "workspace",
+    "claude": { "askHuman": true }
+  }
+}
+```
+
+默认关闭，因为它确实改变 run 的行为：在 `workspace` 下 bridge 会把 Claude 从 `acceptEdits` 切到 `default`，原本自动放行的编辑会停下来问你。
+
+- **允许一次**：只批准这一次调用。
+- **始终允许**：额外存一条规则，由 Claude Code 自己写进项目的 `.claude/settings.local.json`。bridge 不碰这个文件——它只把决定交给 CLI，规则格式由 CLI 说了算。
+- **拒绝**：回绝这次调用，agent 继续往下走。
+
+**没有超时。** 问题会一直等下去，所以你临时走开不会导致 run 被判死刑。代价是卡着的 run 会占住这个会话，直到你做出选择或发 `/stop`。等待期间它会让出并发槽位，别的会话照常跑。往卡住的会话里发消息会被排队，bridge 会回一句告诉你它在等什么。
+
+这条通道承载 CLI 发起的**所有**阻塞式提问，不只是工具权限。bridge 在握手时声明自己能渲染哪些 dialog kind；渲染不了的根本不会发过来，对应流程按 CLI 自己的「无对话」行为降级。
 
 ## 数据目录
 
@@ -322,6 +452,8 @@ pnpm build
 ```
 
 `pnpm test` 包含 unit、integration 和 process-level adapter 测试。CI 在 macOS、Ubuntu、Windows 上执行 `pnpm install --frozen-lockfile`、`pnpm test`、`pnpm typecheck` 和 `pnpm build`。
+
+不管是在终端里跑，还是从 bridge 拉起的 agent 会话里跑，结果都一样：`tests/setup/scrub-bridge-env.ts` 会在任何测试开始前删掉运行中的 bridge 注入给 agent 子进程的那些环境变量（`LARK_CHANNEL*`、`LARKSUITE_CLI_CONFIG_DIR`、`CLAUDE_CODE_USER_DIALOG_TIMEOUT_MS`）。不删的话它们会漏进子进程并改变结果——光 `LARK_CHANNEL_PROFILE` 一个就能把 secret 解析指向只在你本机存在的 profile。这个文件要留着；需要这些变量的测试自己显式设置。
 
 ## 可选：遥测（Telemetry）
 

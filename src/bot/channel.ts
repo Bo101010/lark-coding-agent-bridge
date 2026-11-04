@@ -28,6 +28,9 @@ import {
   type RunState,
 } from '../card/run-state';
 import { renderText } from '../card/text-renderer';
+import { LarkHumanInputRenderer } from '../card/human-input-renderer';
+import { HumanInputBroker } from '../agent/human-input/broker';
+import { PoolSlotParkingLot } from '../runtime/pool-parking-lot';
 import { tryHandleCommand, type Controls } from '../commands';
 import type { AppConfig } from '../config/schema';
 import {
@@ -190,7 +193,6 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   // Concurrency cap — reads `preferences.maxConcurrentRuns` on each acquire,
   // so /config bumps take effect for the next run.
   const pool = new ProcessPool(() => getMaxConcurrentRuns(controls.cfg));
-  const executor = new RunExecutor({ agent, pool, activeRuns });
 
   // Resolve the App Secret to plaintext. The config field can be a literal
   // string, a "${VAR}" template, or a {source, id} SecretRef referencing
@@ -208,6 +210,58 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       })
     : undefined;
   const activePolicyFingerprints = new Map<string, string>();
+  /**
+   * Who started the run currently active in each scope. Permission cards are
+   * signed against this, so only the person whose run it is can answer — a
+   * bystander's click fails the callback's operator binding.
+   */
+  const activeRunInitiators = new Map<string, { chatId: string; operatorOpenId: string }>();
+
+  // Human-in-the-loop approval. Off unless the profile opts in, because it
+  // changes behavior materially: a run that used to proceed on its own will
+  // instead park on a card and wait, with no deadline, until someone
+  // answers or sends `/stop`.
+  const askHuman = controls.profileConfig.permissions.claude?.askHuman === true;
+  const parkingLot = askHuman ? new PoolSlotParkingLot(pool) : undefined;
+  const humanInputRenderer =
+    askHuman
+      ? new LarkHumanInputRenderer({
+          // The channel is created further down (it needs the handlers
+          // defined below), so resolve it lazily — by the time a card is
+          // rendered the run is already streaming through it.
+          getChannel: () => channel,
+          // Scope is `chatId` or `chatId:threadId`; the card goes to the chat.
+          resolveChatId: (scope) => scope.split(':')[0] ?? scope,
+          signCallback: (scope, action) => {
+            const initiator = activeRunInitiators.get(scope);
+            const active = activeRuns.get(scope);
+            if (!callbackAuth || !initiator || !active) return undefined;
+            return callbackAuth.sign({
+              runId: active.run.runId,
+              scope,
+              chatId: initiator.chatId,
+              operatorOpenId: initiator.operatorOpenId,
+              action,
+              policyFingerprint: activePolicyFingerprints.get(scope) ?? '',
+              ttlMs: 24 * 60 * 60 * 1000,
+            });
+          },
+        })
+      : undefined;
+  const humanInput = humanInputRenderer
+    ? new HumanInputBroker({
+        renderers: [humanInputRenderer],
+        ...(parkingLot ? { onPark: parkingLot.observer() } : {}),
+      })
+    : undefined;
+  agent.setHumanInputBroker?.(humanInput);
+
+  const executor = new RunExecutor({
+    agent,
+    pool,
+    activeRuns,
+    ...(parkingLot ? { parkingLot } : {}),
+  });
   // Per-scope record of the model used on the last run, so a `/config` model
   // switch can inject a one-time "model changed" note into the next (resumed)
   // prompt. In-memory only: on restart the first run re-seeds silently.
@@ -316,6 +370,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           cotClient,
           callbackAuth,
           activePolicyFingerprints,
+          activeRunInitiators,
           lastRunModelByScope,
           scope,
           mode,
@@ -349,6 +404,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           logThreadModeOverride,
           executor,
           pool,
+          ...(humanInput ? { humanInput } : {}),
         }),
       ).catch((err) => log.fail('intake', err));
     },
@@ -372,6 +428,8 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           chatModeCache,
           callbackAuth,
           callbackPolicyFingerprintForScope: (scope) => activePolicyFingerprints.get(scope),
+          ...(humanInput ? { humanInput } : {}),
+          ...(humanInputRenderer ? { humanInputRenderer } : {}),
         });
       }).catch((err) => log.fail('cardAction', err));
     },
@@ -625,6 +683,8 @@ interface IntakeDeps {
   logThreadModeOverride: LogThreadModeOverride;
   executor: RunExecutor;
   pool: ProcessPool;
+  /** Present only when human-in-the-loop approval is enabled. */
+  humanInput?: HumanInputBroker;
 }
 
 type LogThreadModeOverride = (input: {
@@ -648,6 +708,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     logThreadModeOverride,
     executor,
     pool,
+    humanInput,
   } = deps;
   const preview = msg.content.length > 80 ? `${msg.content.slice(0, 80)}…` : msg.content;
   // Resolve scope (and underlying chat mode) once at intake — every
@@ -785,6 +846,39 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
 
   const size = pending.push(scope, emsg);
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
+
+  // A run parked on a permission card waits indefinitely, so the queued
+  // message would sit there with no visible reason. Say so once per parked
+  // question rather than letting the chat look dead. Commands (including
+  // `/stop`) are handled above and never reach here.
+  if (size === 1 && humanInput) {
+    const parked = humanInput.pendingForScope(scope);
+    if (parked.length > 0) {
+      await sendAwaitingHumanInputHint(channel, emsg.chatId, emsg.messageId).catch((err) =>
+        log.warn('intake', 'awaiting-human-input-hint-failed', { err: String(err) }),
+      );
+    }
+  }
+}
+
+/** Tell the user their message is queued behind a question only they can clear. */
+async function sendAwaitingHumanInputHint(
+  channel: LarkChannel,
+  chatId: string,
+  replyTo: string,
+): Promise<void> {
+  await channel.send(
+    chatId,
+    {
+      markdown: [
+        '⏳ 上一个任务正在等待你的许可，已经暂停。',
+        '',
+        '请在上方的权限卡片上做出选择；你刚发的消息会在那之后处理。',
+        '不想继续了就发 `/stop`。',
+      ].join('\n'),
+    },
+    { replyTo },
+  );
 }
 
 interface RunBatchDeps {
@@ -799,6 +893,7 @@ interface RunBatchDeps {
   cotClient: CotClient;
   callbackAuth?: CallbackAuth;
   activePolicyFingerprints: Map<string, string>;
+  activeRunInitiators: Map<string, { chatId: string; operatorOpenId: string }>;
   lastRunModelByScope: Map<string, string>;
   scope: string;
   mode: ChatMode;
@@ -817,6 +912,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     cotClient,
     callbackAuth,
     activePolicyFingerprints,
+    activeRunInitiators,
     lastRunModelByScope,
     scope,
     mode,
@@ -993,6 +1089,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
 
   const { execution, cwdRealpath: cwd } = flow;
   activePolicyFingerprints.set(scope, flow.policy.policyFingerprint);
+  // Bind permission cards for this run to whoever triggered it.
+  activeRunInitiators.set(scope, { chatId, operatorOpenId: firstMsg.senderId });
   const handle = execution.handle;
   const eventStream = execution.subscribe();
   if (flow.resumeFrom) {
@@ -1286,6 +1384,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     log.fail('stream', err);
   } finally {
     activePolicyFingerprints.delete(scope);
+    activeRunInitiators.delete(scope);
     scheduleWorkingReactionCleanup(channel, lastMsg.messageId, reactionPromise);
   }
 }

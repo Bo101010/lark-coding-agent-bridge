@@ -1,5 +1,6 @@
 import type { AgentAvailability } from './preflight';
 import type { ClaudePermissionMode, CodexSandboxMode } from '../config/permissions';
+import type { HumanInputBroker } from './human-input/broker';
 
 export type { ClaudePermissionMode } from '../config/permissions';
 
@@ -34,6 +35,12 @@ export interface AgentRunOptions {
   cwd?: string;
   sessionId?: string;
   threadId?: string;
+  /**
+   * Session scope the run belongs to (`chatId`, or `chatId:threadId` for
+   * topic groups). Adapters that route blocking questions back to a human
+   * need it to know which conversation to ask.
+   */
+  scopeId?: string;
   model?: string;
   images?: readonly string[];
   sandbox?: CodexSandboxMode;
@@ -89,4 +96,9 @@ export interface AgentAdapter {
    * Adapters that don't bake identity into their prompts may omit it.
    */
   setBotIdentity?(identity: AgentBotIdentity): void;
+  /**
+   * Late-bound router for blocking human-in-the-loop questions. Adapters
+   * that cannot forward their agent's prompts to a human may omit it.
+   */
+  setHumanInputBroker?(broker: HumanInputBroker | undefined): void;
 }

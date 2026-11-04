@@ -14,6 +14,11 @@ import type { SessionStore } from '../session/store';
 import type { WorkspaceStore } from '../workspace/store';
 import { commandSessionCatalogIdentity } from '../bot/session-catalog-identity';
 import { lookupMessageThreadId } from '../bot/thread-id';
+import type { HumanInputBroker } from '../agent/human-input/broker';
+import type { CanUseToolRequest } from '../agent/human-input/types';
+import { HUMAN_INPUT_MARKER } from './permission-card';
+import { toolDecisionFor, type PermissionChoice } from './permission-decision';
+import { type LarkHumanInputRenderer } from './human-input-renderer';
 
 /** Marker key on a button's value object that flags the cardAction as
  * a callback that should be forwarded back to the agent instead
@@ -23,7 +28,6 @@ import { lookupMessageThreadId } from '../bot/thread-id';
  */
 const BRIDGE_CALLBACK_MARKER = '__bridge_cb';
 const LEGACY_CLAUDE_CALLBACK_MARKER = '__claude_cb';
-
 export interface CardDispatchDeps {
   channel: LarkChannel;
   evt: CardActionEvent;
@@ -40,6 +44,9 @@ export interface CardDispatchDeps {
   callbackAuth?: CallbackAuth;
   callbackPolicyFingerprint?: string;
   callbackPolicyFingerprintForScope?: (scope: string) => string | undefined;
+  /** Routes permission / dialog answers back into the blocked run. */
+  humanInput?: HumanInputBroker;
+  humanInputRenderer?: LarkHumanInputRenderer;
 }
 
 export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
@@ -82,9 +89,17 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
     return;
   }
 
+  // Human-in-the-loop answer: the run is blocked mid-turn waiting on this,
+  // so it must go straight to the broker (and from there to the CLI's
+  // stdin) rather than onto the pending queue as a follow-up message.
+  if (HUMAN_INPUT_MARKER in payload) {
+    await handleHumanInputAnswer(deps, payload, scope);
+    return;
+  }
+
   const cmd = typeof payload.cmd === 'string' ? payload.cmd : '';
   if (cmd) {
-    if (isSignedBridgeCallback(payload) && !verifyBridgeToken(deps, payload, scope, cmd)) {
+    if (isSignedBridgeCallback(payload) && !verifyBridgeToken(deps, payload, scope, cmd).ok) {
       return;
     }
     log.info('cardAction', 'cmd', { cmd, scope });
@@ -133,7 +148,7 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
   // scope's pending queue so the agent resumes its session and sees the click
   // as a follow-up message, with full context of what it sent.
   if (BRIDGE_CALLBACK_MARKER in payload) {
-    if (!verifyBridgeToken(deps, payload, scope, 'agent_callback')) return;
+    if (!verifyBridgeToken(deps, payload, scope, 'agent_callback').ok) return;
     forwardToAgent(deps, payload, formValue, scope, threadId, mode);
     return;
   }
@@ -143,8 +158,7 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
 
 async function resolveScope(
   deps: CardDispatchDeps,
-): Promise<{ scope: string; threadId: string | undefined; mode: 'p2p' | 'group' | 'topic' }> {
-  const chatId = deps.evt.chatId;
+): Promise<{ scope: string; threadId: string | undefined; mode: 'p2p' | 'group' | 'topic' }> {  const chatId = deps.evt.chatId;
   const mode = await deps.chatModeCache.resolve(deps.channel, chatId);
   if (mode !== 'topic') {
     return { scope: chatId, threadId: undefined, mode };
@@ -160,8 +174,93 @@ async function resolveScope(
   return { scope: `${chatId}:${threadId}`, threadId, mode };
 }
 
-function forwardToAgent(
+/**
+ * Deliver a human's answer to a question the CLI is blocked on.
+ *
+ * Unlike an agent-authored callback, this cannot go through the pending
+ * queue: the run is parked mid-turn and only a `control_response` on its
+ * stdin will release it.
+ */
+async function handleHumanInputAnswer(
   deps: CardDispatchDeps,
+  payload: Record<string, unknown>,
+  scope: string,
+): Promise<void> {
+  const requestId = typeof payload.request_id === 'string' ? payload.request_id : '';
+  const choice = payload.choice;
+  if (!requestId || !isPermissionChoice(choice)) {
+    log.warn('cardAction', 'hitl-malformed', { scope });
+    return;
+  }
+
+  if (!deps.humanInput) {
+    log.warn('cardAction', 'hitl-no-broker', { scope, requestId });
+    return;
+  }
+
+  // Signed with the same scheme as other bridge callbacks: binds the click
+  // to this run, chat, and operator, and the nonce makes it single-use so a
+  // card cannot be replayed to approve a second time.
+  const auth = verifyBridgeToken(deps, payload, scope, `hitl:${requestId}`);
+  if (!auth.ok) {
+    // A refused click used to be completely silent, so the card sat there
+    // unchanged and the clicker could not tell whether their tap registered.
+    // Repaint the reason — but only for a click that actually carried a
+    // token, so a payload with no token at all cannot repaint a live card.
+    if (hasBridgeToken(payload)) {
+      void deps.humanInputRenderer
+        ?.notice(requestId, refusalNotice(auth.reason))
+        .catch((err: unknown) => {
+          log.fail('cardAction', err, { step: 'hitl-refusal-notice', requestId });
+        });
+    }
+    return;
+  }
+
+  const pending = deps.humanInputRenderer?.pendingFor(requestId);
+  if (!pending) {
+    log.info('cardAction', 'hitl-stale', { scope, requestId });
+    return;
+  }
+
+  const answer =
+    pending.kind === 'can_use_tool'
+      ? toolDecisionFor(pending.request as CanUseToolRequest, choice)
+      : dialogAnswerFor(choice);
+
+  const delivered = deps.humanInput.answer(requestId, answer);
+  if (!delivered) {
+    log.info('cardAction', 'hitl-already-settled', { scope, requestId });
+    return;
+  }
+
+  log.info('cardAction', 'hitl-answered', { scope, requestId, choice });
+  // Detached on purpose. Lark's client keeps the card locked while this
+  // handler is pending and restores its cached copy the moment it returns,
+  // discarding a repaint made in the meantime — an answered card would then
+  // still look unanswered. The renderer waits out the round trip itself; see
+  // its `settleDelayMs`.
+  void deps.humanInputRenderer
+    ?.settle(requestId, choice, deps.evt.operator.name)
+    .catch((err: unknown) => {
+      log.fail('cardAction', err, { step: 'hitl-settle', requestId });
+    });
+}
+
+/**
+ * Generic dialog answer. The payload shape is defined per `dialog_kind`;
+ * `behavior` is the one field the CLI's dialog settlement understands
+ * across kinds.
+ */
+function dialogAnswerFor(choice: PermissionChoice): Record<string, unknown> {
+  return choice === 'deny' ? { behavior: 'cancelled' } : { behavior: 'confirmed' };
+}
+
+function isPermissionChoice(value: unknown): value is PermissionChoice {
+  return value === 'allow-once' || value === 'allow-always' || value === 'deny';
+}
+
+function forwardToAgent(  deps: CardDispatchDeps,
   payload: Record<string, unknown>,
   formValue: Record<string, unknown> | undefined,
   scope: string,
@@ -197,18 +296,35 @@ function forwardToAgent(
   deps.pending.push(scope, synthetic);
 }
 
+/**
+ * Why a click was refused. `missing-token-or-run` is ours — it covers the
+ * cases where there is nothing to verify against; the rest come from
+ * `CallbackAuth.verify`.
+ */
+type CallbackRefusalReason =
+  | 'missing-token-or-run'
+  | 'malformed'
+  | 'unknown-key'
+  | 'bad-signature'
+  | 'expired'
+  | 'context-mismatch'
+  | 'nonce-replay'
+  | 'nonce-revoked';
+
+type CallbackAuthOutcome = { ok: true } | { ok: false; reason: CallbackRefusalReason };
+
 function verifyBridgeToken(
   deps: CardDispatchDeps,
   payload: Record<string, unknown>,
   scope: string,
   action: string,
-): boolean {
+): CallbackAuthOutcome {
   const token = typeof payload.bridge_token === 'string' ? payload.bridge_token : '';
   const active = deps.activeRuns.get(scope);
   if (!deps.callbackAuth || !token || !active) {
     log.info('cardAction', 'skip-callback-auth-missing', { scope, action });
     log.warn('callback', 'denied', { scope, action, reason: 'missing-token-or-run' });
-    return false;
+    return { ok: false, reason: 'missing-token-or-run' };
   }
   const result = deps.callbackAuth.verify(token, {
     runId: active.run.runId,
@@ -228,9 +344,34 @@ function verifyBridgeToken(
       reason: result.reason,
     });
     log.warn('callback', 'denied', { scope, action, reason: result.reason });
-    return false;
+    return { ok: false, reason: result.reason };
   }
-  return true;
+  return { ok: true };
+}
+
+/**
+ * Wording for a click that did not take effect. `context-mismatch` is the
+ * one a real user actually hits: the card is bound to whoever started the
+ * run, so anyone else in the chat is refused.
+ */
+function refusalNotice(reason: CallbackRefusalReason): string {
+  switch (reason) {
+    case 'context-mismatch':
+      return '⚠️ 这张卡只能由发起该请求的人操作，这次点击没有生效。';
+    case 'expired':
+      return '⚠️ 这张卡已经过期，这次点击没有生效。';
+    case 'nonce-replay':
+    case 'nonce-revoked':
+      return '⚠️ 这张卡已经处理过了，这次点击没有生效。';
+    case 'missing-token-or-run':
+      return '⚠️ 对应的运行已经结束，这张卡不再生效。';
+    default:
+      return '⚠️ 这次点击没有生效。';
+  }
+}
+
+function hasBridgeToken(payload: Record<string, unknown>): boolean {
+  return typeof payload.bridge_token === 'string' && payload.bridge_token.length > 0;
 }
 
 function isSignedBridgeCallback(payload: Record<string, unknown>): boolean {

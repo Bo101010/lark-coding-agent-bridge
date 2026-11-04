@@ -5,7 +5,7 @@ import type { ChatModeCache } from '../../../src/bot/chat-mode-cache.js';
 import { PendingQueue } from '../../../src/bot/pending-queue.js';
 import { CallbackAuth } from '../../../src/card/callback-auth.js';
 import { CallbackNonceStore } from '../../../src/card/callback-store.js';
-import { handleCardAction } from '../../../src/card/dispatcher.js';
+import { handleCardAction, type CardDispatchDeps } from '../../../src/card/dispatcher.js';
 import type { Controls } from '../../../src/commands/index.js';
 import { createDefaultProfileConfig } from '../../../src/config/profile-schema.js';
 import { SessionStore } from '../../../src/session/store.js';
@@ -115,6 +115,62 @@ describe('signed card callback dispatch', () => {
   });
 });
 
+describe('human-in-the-loop card answers', () => {
+  afterEach(async () => {
+    await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
+  });
+
+  it('delivers the answer and freezes the card', async () => {
+    const h = await createHarness({ hitl: true });
+    h.activeRuns.register('oc_group', h.agent.run({ runId: 'run-active', prompt: 'running' }));
+
+    await h.dispatch({
+      __bridge_hitl: true,
+      request_id: 'req-1',
+      choice: 'allow-once',
+      bridge_token: h.token('hitl:req-1'),
+    });
+
+    expect(h.hitl.answered).toEqual([{ requestId: 'req-1', answer: { behavior: 'allow' } }]);
+    expect(h.hitl.settled).toEqual([
+      { requestId: 'req-1', choice: 'allow-once', operatorName: 'Operator' },
+    ]);
+    expect(h.hitl.notices).toEqual([]);
+  });
+
+  it('explains a refused click instead of swallowing it', async () => {
+    const h = await createHarness({ hitl: true });
+    h.activeRuns.register('oc_group', h.agent.run({ runId: 'run-active', prompt: 'running' }));
+
+    // The card is bound to whoever started the run, so a click from anyone
+    // else is refused. Silently ignoring it left the clicker staring at a
+    // card that looked untouched.
+    await h.dispatch({
+      __bridge_hitl: true,
+      request_id: 'req-1',
+      choice: 'allow-once',
+      bridge_token: h.token('hitl:req-1', { operatorOpenId: 'ou_someone_else' }),
+    });
+
+    expect(h.hitl.answered).toEqual([]);
+    expect(h.hitl.settled).toEqual([]);
+    expect(h.hitl.notices).toHaveLength(1);
+    expect(h.hitl.notices[0]?.text).toContain('只能由发起该请求的人操作');
+  });
+
+  it('says nothing when a click carried no token at all', async () => {
+    const h = await createHarness({ hitl: true });
+    h.activeRuns.register('oc_group', h.agent.run({ runId: 'run-active', prompt: 'running' }));
+
+    // A payload with no token is not a real click on a real card — anyone
+    // could forge one. Repainting here would let them wipe a live card.
+    await h.dispatch({ __bridge_hitl: true, request_id: 'req-1', choice: 'allow-once' });
+
+    expect(h.hitl.answered).toEqual([]);
+    expect(h.hitl.notices).toEqual([]);
+  });
+});
+
 type Harness = {
   tmp: TmpProfile;
   channel: FakeChannel;
@@ -125,6 +181,7 @@ type Harness = {
   controls: Controls;
   pending: PendingQueue;
   auth: CallbackAuth;
+  hitl: HitlSpy;
   dispatch(value: Record<string, unknown>, formValue?: Record<string, unknown>): Promise<void>;
   token(
     action: string,
@@ -132,8 +189,19 @@ type Harness = {
   ): string;
 };
 
+/** Records what the dispatcher did with a parked question. */
+type HitlSpy = {
+  answered: Array<{ requestId: string; answer: unknown }>;
+  settled: Array<{ requestId: string; choice: string; operatorName?: string }>;
+  notices: Array<{ requestId: string; text: string }>;
+};
+
 async function createHarness(
-  opts: { callbackAuth?: boolean; chatMode?: 'p2p' | 'group' | 'topic' } = {},
+  opts: {
+    callbackAuth?: boolean;
+    chatMode?: 'p2p' | 'group' | 'topic';
+    hitl?: boolean;
+  } = {},
 ): Promise<Harness> {
   const tmp = await createTmpProfile('callback-dispatch-test-');
   const channel = createFakeChannel();
@@ -179,6 +247,33 @@ async function createHarness(
     await tmp.cleanup();
   });
 
+  const hitl: HitlSpy = { answered: [], settled: [], notices: [] };
+  const humanInput = {
+    answer: (requestId: string, answer: unknown) => {
+      hitl.answered.push({ requestId, answer });
+      return true;
+    },
+  };
+  const humanInputRenderer = {
+    pendingFor: (requestId: string) =>
+      requestId === 'req-1'
+        ? {
+            requestId,
+            runId: 'run-active',
+            scope: 'oc_group',
+            kind: 'can_use_tool' as const,
+            request: { subtype: 'can_use_tool' as const, tool_name: 'Bash' },
+            askedAt: 1000,
+          }
+        : undefined,
+    settle: async (requestId: string, choice: string, operatorName?: string) => {
+      hitl.settled.push({ requestId, choice, ...(operatorName ? { operatorName } : {}) });
+    },
+    notice: async (requestId: string, text: string) => {
+      hitl.notices.push({ requestId, text });
+    },
+  };
+
   return {
     tmp,
     channel,
@@ -189,6 +284,7 @@ async function createHarness(
     controls,
     pending,
     auth,
+    hitl,
     token: (action, overrides = {}) => {
       nonce = overrides.nonce ?? `nonce-${action}`;
       return auth.sign({
@@ -214,6 +310,13 @@ async function createHarness(
         chatModeCache,
         ...(opts.callbackAuth === false ? {} : { callbackAuth: auth }),
         callbackPolicyFingerprint: 'fp-1',
+        ...(opts.hitl
+          ? {
+              humanInput: humanInput as unknown as CardDispatchDeps['humanInput'],
+              humanInputRenderer:
+                humanInputRenderer as unknown as CardDispatchDeps['humanInputRenderer'],
+            }
+          : {}),
       }),
   };
 }

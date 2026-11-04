@@ -55,9 +55,21 @@ export async function sendManagedCard(
 
 /**
  * Update a managed card identified by the messageId of the message that
- * carries it. CardKit card-id sends use the per-card sequence required by the
- * card server; raw-card fallback sends can only be updated by messageId, so the
- * local sequence is diagnostic metadata for that path.
+ * carries it.
+ *
+ * Two writes are possible and neither is sufficient on its own:
+ *
+ *  - `cardkit.v1.card.update` targets the shared card entity, and is the only
+ *    write that reaches every message referencing that entity. It has been
+ *    observed to report success while the message carrying the card kept
+ *    rendering the previous content — an answered permission card then still
+ *    looks unanswered, which is exactly the signal the greying-out exists to
+ *    give.
+ *  - `im.v1.message.patch` targets this one message, and is what the reader
+ *    actually sees change.
+ *
+ * So send both, and only fail when both fail. The entity write keeps any other
+ * reference in sync; the patch is what makes this message right.
  */
 export async function updateManagedCard(
   channel: LarkChannel,
@@ -69,21 +81,60 @@ export async function updateManagedCard(
     throw new Error(`no managed card registered for message ${messageId}`);
   }
   entry.sequence += 1;
+
+  const patchErr = await patchMessage(channel, messageId, card);
+  const entityErr =
+    entry.kind === 'card-id' ? await updateEntity(channel, entry, card, messageId) : undefined;
+
+  if (patchErr && entityErr) throw entityErr;
+}
+
+/**
+ * Card-entity write. The sequence must increase per card — the card server
+ * rejects stale ones rather than letting a slow update clobber a newer one.
+ * Best-effort: the message patch is what the reader sees, so a failure here is
+ * reported and returned, not thrown.
+ */
+async function updateEntity(
+  channel: LarkChannel,
+  entry: ManagedEntry,
+  card: object,
+  messageId: string,
+): Promise<unknown> {
   try {
-    if (entry.kind === 'card-id') {
-      await channel.updateCardById(entry.cardId!, card, entry.sequence);
-    } else {
-      await channel.updateCard(messageId, card);
-    }
-  } catch (err) {
-    log.fail('card', err, {
-      step: 'managed-update',
-      kind: entry.kind,
+    await channel.updateCardById(entry.cardId!, card, entry.sequence);
+    log.info('card', 'managed-updated', {
+      messageId,
       cardId: entry.cardId,
       seq: entry.sequence,
+      summary: summaryOf(card),
     });
-    throw err;
+    return undefined;
+  } catch (err) {
+    log.fail('card', err, { step: 'managed-update', cardId: entry.cardId, seq: entry.sequence });
+    return err;
   }
+}
+
+/** Message write — the one the reader sees. Best-effort, same as the above. */
+async function patchMessage(
+  channel: LarkChannel,
+  messageId: string,
+  card: object,
+): Promise<unknown> {
+  try {
+    await channel.updateCard(messageId, card);
+    log.info('card', 'managed-patched', { messageId, summary: summaryOf(card) });
+    return undefined;
+  } catch (err) {
+    log.fail('card', err, { step: 'managed-patch', messageId });
+    return err;
+  }
+}
+
+function summaryOf(card: unknown): unknown {
+  const config = (card as { config?: { summary?: { content?: unknown } } } | undefined)?.config;
+  return config?.summary?.content;
 }
 
 /** True iff we have the card_id mapping for this messageId. */

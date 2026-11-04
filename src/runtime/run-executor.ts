@@ -5,6 +5,7 @@ import { ProcessPool } from '../bot/process-pool';
 import type { RunPolicyAllow } from '../policy/run-policy';
 import { log } from '../core/logger';
 import { RunRejected, SpawnFailed } from './errors';
+import type { PoolSlotParkingLot } from './pool-parking-lot';
 
 export interface RunExecutorDeps {
   agent: AgentAdapter;
@@ -13,6 +14,11 @@ export interface RunExecutorDeps {
   createRunId?: () => string;
   now?: () => number;
   postDoneExitGraceMs?: number;
+  /**
+   * Lends a run's pool slot back while it waits on a human. Absent when
+   * human-in-the-loop approval is off, in which case runs never park.
+   */
+  parkingLot?: PoolSlotParkingLot;
 }
 
 export interface SubmitRunInput {
@@ -50,6 +56,7 @@ export class RunExecutor {
   private readonly createRunId: () => string;
   private readonly now: () => number;
   private readonly postDoneExitGraceMs: number;
+  private readonly parkingLot: PoolSlotParkingLot | undefined;
 
   constructor(deps: RunExecutorDeps) {
     this.agent = deps.agent;
@@ -58,6 +65,7 @@ export class RunExecutor {
     this.createRunId = deps.createRunId ?? randomUUID;
     this.now = deps.now ?? Date.now;
     this.postDoneExitGraceMs = deps.postDoneExitGraceMs ?? DEFAULT_POST_DONE_EXIT_GRACE_MS;
+    this.parkingLot = deps.parkingLot;
   }
 
   async submit(input: SubmitRunInput): Promise<RunExecution> {
@@ -99,6 +107,7 @@ export class RunExecutor {
       cwd: input.policy.cwdRealpath,
       sessionId: input.sessionId,
       threadId: input.threadId,
+      scopeId: input.scopeId,
       model: input.model,
       images: input.images,
       sandbox: input.policy.sandbox,
@@ -158,11 +167,17 @@ export class RunExecutor {
       );
     }
     let cleaned = false;
+    // Must be tracked before any event is consumed: the CLI can raise a
+    // permission request on its very first tool call.
+    this.parkingLot?.track(runId, release);
     const cleanup = async (waitForExit: boolean): Promise<void> => {
       if (cleaned) return;
       cleaned = true;
       this.activeRuns.unregister(input.scopeId, run);
-      release();
+      // Release whichever slot the run holds now: if it parked on a human
+      // question and re-acquired, that is a different closure than the one
+      // captured above, and releasing the stale one would leak a slot.
+      (this.parkingLot?.takeRelease(runId) ?? release)();
       if (waitForExit) {
         const exited = await run.waitForExit(this.postDoneExitGraceMs);
         if (!exited) {

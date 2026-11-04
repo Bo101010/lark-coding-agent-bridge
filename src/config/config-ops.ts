@@ -9,7 +9,13 @@ import {
 } from './profile-store';
 import { saveConfig } from './store';
 import { secretKeyForApp, type AppConfig, type AppPreferences } from './schema';
-import type { ProfileAccess, ProfileConfig, ProfileMode } from './profile-schema';
+import type {
+  PermissionConfig,
+  ProfileAccess,
+  ProfileConfig,
+  ProfileMode,
+} from './profile-schema';
+import type { ClaudePermissionMode } from './permissions';
 import { applyLarkCliIdentityPolicy } from '../lark-cli/identity-policy';
 import { log, reportMetric } from '../core/logger';
 
@@ -118,6 +124,55 @@ export async function saveAccessConfig(
     reportMetric('command_fail', 1, { step: 'access.save' });
     throw err;
   }
+}
+
+/**
+ * Pin (or clear) the profile's Claude permission mode under the config file
+ * lock, refreshing in-memory state. `undefined` removes the override so the
+ * mode goes back to being derived from the access level.
+ *
+ * Unlike `askHuman`, which is read once at startChannel time to decide whether
+ * to install the human-in-the-loop surface, the mode is read per run from
+ * `profileConfig.permissions` — so a change here takes effect on the next run
+ * without a restart.
+ */
+export async function saveClaudePermissionMode(
+  state: MutableProfileState,
+  mode: ClaudePermissionMode | undefined,
+): Promise<void> {
+  try {
+    await withConfigFileLock(state.configPath, async () => {
+      const root = await loadRootConfig(state.configPath);
+      if (!root) throw new Error(`config not found: ${state.configPath}`);
+      const profile = root.profiles[state.profile];
+      if (!profile) throw new Error(`profile not found: ${state.profile}`);
+
+      const next = withClaudePermissionMode(profile.permissions, mode);
+      root.profiles[state.profile] = { ...profile, permissions: next };
+      await saveRootConfig(root, state.configPath);
+      state.profileConfig = root.profiles[state.profile]!;
+      state.cfg = runtimeProfileConfig(root, state.profile);
+      log.info('config-ops', 'claude-permission-mode-set', {
+        profile: state.profile,
+        permissionMode: mode ?? null,
+      });
+    });
+  } catch (err) {
+    reportMetric('command_fail', 1, { step: 'claude-permission-mode.save' });
+    throw err;
+  }
+}
+
+/** Set or drop `claude.permissionMode` without disturbing `askHuman` or the
+ * rest of the claude block; drop the block entirely when it would be empty. */
+function withClaudePermissionMode(
+  permissions: PermissionConfig,
+  mode: ClaudePermissionMode | undefined,
+): PermissionConfig {
+  const { permissionMode: _previous, ...restClaude } = permissions.claude ?? {};
+  const claude = mode === undefined ? restClaude : { ...restClaude, permissionMode: mode };
+  const { claude: _drop, ...withoutClaude } = permissions;
+  return Object.keys(claude).length > 0 ? { ...withoutClaude, claude } : withoutClaude;
 }
 
 /**

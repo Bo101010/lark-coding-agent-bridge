@@ -26,7 +26,13 @@ export interface FakeChannel {
    * card dispatcher reads to scope topic-group clicks. Empty by default.
    */
   readonly rawThreadIds: Map<string, string>;
-  fetchRawMessage(messageId: string): Promise<Array<{ thread_id?: string }>>;
+  /** Make `updateCardById` reject, as a stale or expired entity would. */
+  failCardUpdates: boolean;
+  /** Make `updateCard` reject, as an unpatched-able message would. */
+  failCardPatches: boolean;
+  fetchRawMessage(
+    messageId: string,
+  ): Promise<Array<{ thread_id?: string; body?: { content?: string } }>>;
   readonly rawClient: {
     readonly requests: FakeRawClientRequest[];
     request(method: string, params: unknown): Promise<unknown>;
@@ -50,6 +56,7 @@ export interface FakeChannel {
   };
   createCard(cardJson: unknown): Promise<{ cardId: string }>;
   updateCardById(cardId: string, cardJson: unknown, sequence: number): Promise<void>;
+  updateCard(messageId: string, cardJson: unknown): Promise<void>;
   send(chatId: string, content: unknown, options?: unknown): Promise<{ messageId: string }>;
   stream(chatId: string, input: unknown, options?: unknown): Promise<void>;
 }
@@ -60,6 +67,8 @@ export function createFakeChannel(): FakeChannel {
   const requests: FakeRawClientRequest[] = [];
   const rawThreadIds = new Map<string, string>();
   const cardById = new Map<string, unknown>();
+  let failCardUpdates = false;
+  let failCardPatches = false;
   let nextCard = 1;
   let nextMessage = 1;
 
@@ -78,7 +87,21 @@ export function createFakeChannel(): FakeChannel {
     sent,
     streams,
     rawThreadIds,
-    async fetchRawMessage(messageId: string): Promise<Array<{ thread_id?: string }>> {
+    get failCardUpdates(): boolean {
+      return failCardUpdates;
+    },
+    set failCardUpdates(value: boolean) {
+      failCardUpdates = value;
+    },
+    get failCardPatches(): boolean {
+      return failCardPatches;
+    },
+    set failCardPatches(value: boolean) {
+      failCardPatches = value;
+    },
+    async fetchRawMessage(
+      messageId: string,
+    ): Promise<Array<{ thread_id?: string; body?: { content?: string } }>> {
       const threadId = rawThreadIds.get(messageId);
       return [threadId ? { thread_id: threadId } : {}];
     },
@@ -128,6 +151,11 @@ export function createFakeChannel(): FakeChannel {
     },
     async updateCardById(cardId: string, cardJson: unknown, sequence: number): Promise<void> {
       requests.push({ method: 'cardkit.v1.card.update', params: { cardId, cardJson, sequence } });
+      if (failCardUpdates) throw new Error('card entity update failed');
+    },
+    async updateCard(messageId: string, cardJson: unknown): Promise<void> {
+      requests.push({ method: 'im.v1.message.patch', params: { messageId, cardJson } });
+      if (failCardPatches) throw new Error('message patch failed');
     },
     async send(chatId: string, content: unknown, options?: unknown): Promise<{ messageId: string }> {
       // Resolve a `{ cardId }` reference back to the card JSON so assertions

@@ -2,12 +2,14 @@ import { describe, expect, it } from 'vitest';
 import {
   accessToClaudePermissionMode,
   clampAccess,
+  type PermissionConfig,
 } from '../../../src/config/permissions';
 import {
   createDefaultProfileConfig,
   effectiveLarkCliIdentity,
   normalizeProfileConfig,
 } from '../../../src/config/profile-schema';
+import { formatRootConfig } from '../../../src/config/profile-store';
 
 const app = {
   id: 'cli_test',
@@ -439,8 +441,118 @@ describe('profile schema', () => {
     expect(accessToClaudePermissionMode('full', cfg.permissions)).toBe('default');
   });
 
-  it('clamps access by both profile and capability maximums', () => {
-    expect(clampAccess('full', 'workspace', 'full')).toBe('workspace');
+  it('accepts the auto permission mode at full access', () => {
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      permissions: {
+        defaultAccess: 'full',
+        maxAccess: 'full',
+        claude: { permissionMode: 'auto' },
+      },
+    });
+
+    expect(accessToClaudePermissionMode('full', cfg.permissions)).toBe('auto');
+  });
+
+  it('rejects auto when maxAccess is below full', () => {
+    // `auto` lets the classifier approve pushes and PR creation, so a
+    // workspace profile must not be able to select it.
+    expect(() =>
+      normalizeProfileConfig({
+        schemaVersion: 2,
+        agentKind: 'claude',
+        accounts: { app },
+        permissions: {
+          defaultAccess: 'workspace',
+          maxAccess: 'workspace',
+          claude: { permissionMode: 'auto' },
+        },
+      }),
+    ).toThrow(/permission/i);
+  });
+
+  it('keeps workspace on acceptEdits unless human approval is requested', () => {
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      permissions: { defaultAccess: 'workspace', maxAccess: 'workspace' },
+    });
+
+    // Default behavior is unchanged: existing workspace profiles keep
+    // auto-approving edits rather than suddenly blocking on a card.
+    expect(accessToClaudePermissionMode('workspace', cfg.permissions)).toBe('acceptEdits');
+  });
+
+  it('switches workspace to default mode when askHuman is on, so prompts fire', () => {
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      permissions: {
+        defaultAccess: 'workspace',
+        maxAccess: 'workspace',
+        claude: { askHuman: true },
+      },
+    });
+
+    expect(cfg.permissions.claude?.askHuman).toBe(true);
+    // acceptEdits would never prompt; `default` is what raises the
+    // can_use_tool requests the bridge renders as Lark cards.
+    expect(accessToClaudePermissionMode('workspace', cfg.permissions)).toBe('default');
+  });
+
+  it('keeps askHuman across a save/load round trip', () => {
+    // The unit tests above stop at normalizeProfileConfig. A profile that
+    // normalizes correctly but loses askHuman on serialize would silently
+    // fall back to acceptEdits on the next restart — the run stops prompting
+    // and the human-in-the-loop flow disappears with no error anywhere.
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      permissions: {
+        defaultAccess: 'workspace',
+        maxAccess: 'workspace',
+        claude: { askHuman: true },
+      },
+    });
+
+    const text = formatRootConfig({
+      schemaVersion: 2,
+      activeProfile: 'hitl',
+      preferences: {},
+      profiles: { hitl: cfg },
+    });
+    const stored = JSON.parse(text) as {
+      profiles: Record<string, { permissions?: PermissionConfig }>;
+    };
+
+    expect(stored.profiles.hitl?.permissions?.claude?.askHuman).toBe(true);
+    // And it must still select `default` after coming back off disk.
+    expect(accessToClaudePermissionMode('workspace', stored.profiles.hitl?.permissions)).toBe(
+      'default',
+    );
+  });
+
+  it('rejects a non-boolean askHuman', () => {
+    expect(() =>
+      normalizeProfileConfig({
+        schemaVersion: 2,
+        agentKind: 'claude',
+        accounts: { app },
+        permissions: {
+          defaultAccess: 'workspace',
+          maxAccess: 'workspace',
+          claude: { askHuman: 'yes' as unknown as boolean },
+        },
+      }),
+    ).toThrow(/askHuman/);
+  });
+
+  it('clamps access by both profile and capability maximums', () => {    expect(clampAccess('full', 'workspace', 'full')).toBe('workspace');
     expect(clampAccess('workspace', 'full', 'read-only')).toBe('read-only');
     expect(clampAccess('read-only', 'full', 'full')).toBe('read-only');
   });

@@ -17,10 +17,19 @@ import {
   type AgentRunOptions,
 } from '../types';
 import { translateEvent } from './stream-json';
+import { ClaudeControlChannel } from './control-channel';
+import type { HumanInputBroker } from '../human-input/broker';
 
 export interface ClaudeAdapterOptions {
   binary?: string;
   larkChannel?: LarkChannelEnvContext;
+  /**
+   * Routes the CLI's blocking human-in-the-loop questions (tool permission
+   * prompts and `request_user_dialog`) to a human. When absent the adapter
+   * keeps its legacy fire-and-forget behavior: stdin closes immediately and
+   * the CLI answers its own prompts per `--permission-mode`.
+   */
+  humanInput?: HumanInputBroker;
 }
 
 type ClaudeChild = SpawnedProcessByStdio<Writable, Readable, Readable>;
@@ -31,15 +40,26 @@ export class ClaudeAdapter implements AgentAdapter {
 
   private readonly binary: string;
   private readonly larkChannel: LarkChannelEnvContext | undefined;
+  private humanInput: HumanInputBroker | undefined;
   private botIdentity: AgentBotIdentity | undefined;
 
   constructor(opts: ClaudeAdapterOptions = {}) {
     this.binary = opts.binary ?? 'claude';
     this.larkChannel = opts.larkChannel;
+    this.humanInput = opts.humanInput;
   }
 
   setBotIdentity(identity: AgentBotIdentity): void {
     this.botIdentity = identity;
+  }
+
+  /**
+   * Late-bound, like `setBotIdentity`: the adapter is built per profile
+   * before the Lark channel exists, but the broker's renderer needs that
+   * channel to post cards. Passing undefined keeps the one-shot behavior.
+   */
+  setHumanInputBroker(broker: HumanInputBroker | undefined): void {
+    this.humanInput = broker;
   }
 
   async isAvailable(): Promise<boolean> {
@@ -70,6 +90,11 @@ export class ClaudeAdapter implements AgentAdapter {
     // special characters ever reach the shell.
     const systemPromptFile = writeSystemPromptFile(buildBridgeSystemPrompt(this.botIdentity));
 
+    // Human-in-the-loop mode needs a two-way channel: the CLI asks us to
+    // approve a tool (or render a dialog) and blocks until a matching
+    // control_response arrives, so stdin has to stay open for the whole run.
+    const interactive = this.humanInput !== undefined;
+
     const args = [
       '-p',
       '--output-format',
@@ -80,12 +105,44 @@ export class ClaudeAdapter implements AgentAdapter {
       '--append-system-prompt-file',
       systemPromptFile.path,
     ];
+    if (interactive) {
+      // Both flags are load-bearing, and neither works alone.
+      //
+      // `--permission-prompt-tool stdio` is what installs the host permission
+      // surface: the CLI only builds it when this flag is exactly `stdio`
+      // (getCanUseToolFn: `if (!none && tool === "stdio") return
+      // createCanUseTool(...)`). Without it the run silently falls through to
+      // the no-prompt path — no can_use_tool request is ever emitted, and each
+      // ask settles as a fail-closed denial with the reason
+      // `ask_refused_no_surface`. `--permission-prompts host` then declares
+      // that the stdio surface is answered by a host rather than denied
+      // locally; its only other accepted value is `none`, which forces a local
+      // deny. Passing just one of the two looks like it works — the run
+      // proceeds and tools are denied as if the human had said no — so keep
+      // them together.
+      args.push(
+        '--input-format',
+        'stream-json',
+        '--permission-prompt-tool',
+        'stdio',
+        '--permission-prompts',
+        'host',
+      );
+    }
     if (opts.sessionId) args.push('--resume', opts.sessionId);
     if (opts.model) args.push('--model', opts.model);
 
     const child = spawnProcess(this.binary, args, {
       cwd: opts.cwd,
-      env: mergeProcessEnv(process.env, buildLarkChannelEnv(this.larkChannel)),
+      env: mergeProcessEnv(process.env, {
+        ...buildLarkChannelEnv(this.larkChannel),
+        // A question routed to Lark waits for a human with no deadline, by
+        // design. The CLI would otherwise cancel a forwarded dialog after
+        // its own 5-minute deadline and settle it as dismissed, so the card
+        // would quietly stop working. "never" is the documented sentinel
+        // that disables that timer; `/stop` is the escape hatch instead.
+        ...(interactive ? { CLAUDE_CODE_USER_DIALOG_TIMEOUT_MS: 'never' } : {}),
+      }),
       stdio: ['pipe', 'pipe', 'pipe'],
     }) as ClaudeChild;
 
@@ -132,7 +189,27 @@ export class ClaudeAdapter implements AgentAdapter {
     child.stdin.on('error', (err) => {
       log.warn('agent', 'stdin-error', { message: err.message });
     });
-    child.stdin.end(opts.prompt, 'utf8');
+
+    const control = interactive
+      ? new ClaudeControlChannel({
+          stdin: child.stdin,
+          broker: this.humanInput,
+          runId: opts.runId,
+          scope: opts.scopeId ?? opts.runId,
+        })
+      : undefined;
+
+    if (control) {
+      // stdin stays OPEN for the whole run: closing it tells the CLI to
+      // finish the current turn and exit, which would make it impossible to
+      // answer any permission prompt it is about to raise.
+      control.sendInitialize();
+      control.sendUserMessage(opts.prompt);
+    } else {
+      child.stdin.end(opts.prompt, 'utf8');
+    }
+
+    child.on('exit', () => control?.close());
 
     // Default 5s if caller didn't specify — claude often has live
     // subprocesses (lark-cli waiting for OAuth, long Bash, etc.) and the
@@ -143,9 +220,13 @@ export class ClaudeAdapter implements AgentAdapter {
 
     return {
       runId: opts.runId,
-      events: createEventStream(child, stderrChunks, () => runtimeError),
+      events: createEventStream(child, stderrChunks, () => runtimeError, control),
       async stop() {
         if (child.exitCode !== null || child.signalCode !== null) return;
+        // Drop anything parked first: a question waiting on a human has no
+        // deadline, so without this the broker would keep a promise (and
+        // its card) alive for a process that is going away.
+        control?.close();
         log.info('agent', 'stop-sigterm', { pid: child.pid ?? null, graceMs: stopGraceMs });
         child.kill('SIGTERM');
         await new Promise<void>((resolve) => {
@@ -190,6 +271,7 @@ async function* createEventStream(
   child: ClaudeChild,
   stderrChunks: Buffer[],
   getError: () => Error | null,
+  control?: ClaudeControlChannel,
 ): AsyncGenerator<AgentEvent> {
   // If fork itself failed synchronously, child.pid is undefined. The 'error'
   // event (ENOENT etc.) fires in the next tick, so also check getError().
@@ -221,14 +303,25 @@ async function* createEventStream(
       try {
         parsed = JSON.parse(trimmed);
       } catch {
+        // A line we cannot parse is a frame we silently drop — including, in
+        // principle, a control_request the run is blocked on. Record it so a
+        // lost frame leaves a trace instead of vanishing.
+        log.warn('agent', 'stdout-unparseable', { preview: trimmed.slice(0, 300) });
         continue;
       }
+      // Control frames are a side conversation with the host, not agent
+      // output — handleFrame() claims them so they never reach the renderer.
+      if (control?.handleFrame(parsed)) continue;
       yield* translateEvent(parsed);
     }
   } finally {
     if (silentExitTimer) clearTimeout(silentExitTimer);
     child.removeListener('exit', closeSilentStdout);
     rl.close();
+    // The turn is over and nothing more can be asked of a human. Closing
+    // stdin is also what tells an interactive CLI it may exit.
+    control?.close();
+    if (!child.stdin.writableEnded) child.stdin.end();
   }
 
   const earlyRuntimeError = getError();

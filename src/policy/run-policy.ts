@@ -3,6 +3,7 @@ import {
   accessToClaudePermissionMode,
   accessToCodexSandbox,
   clampAccess,
+  elevateAccessForClaudePermissionMode,
   type AccessMode,
   type ClaudePermissionMode,
   type CodexSandboxMode,
@@ -104,11 +105,21 @@ export function evaluateRunPolicy(input: RunPolicyInput): RunPolicyResult {
     return reject('required-attachment-rejected', '必需附件未通过校验，已拒绝运行。');
   }
 
-  const accessMode = clampAccess(
+  const derivedAccess = clampAccess(
     input.profileConfig.permissions.defaultAccess,
     input.profileConfig.permissions.maxAccess,
     input.capability.permissions.maxAccess,
   );
+  // Only Claude has a permission mode to pin; a Codex profile keeps the tier
+  // its sandbox was derived from.
+  const accessMode =
+    input.capability.agentId === 'claude'
+      ? elevateAccessForClaudePermissionMode(
+          derivedAccess,
+          input.profileConfig.permissions,
+          input.capability.permissions.maxAccess,
+        )
+      : derivedAccess;
   const sandbox = accessToCodexSandbox(accessMode);
   const permissionMode = accessToClaudePermissionMode(
     accessMode,
