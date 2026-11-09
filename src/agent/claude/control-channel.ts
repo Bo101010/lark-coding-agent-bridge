@@ -197,6 +197,7 @@ function parseControlRequest(record: Record<string, unknown>): ControlRequestEnv
         tool_name: body.tool_name,
         ...(typeof body.tool_use_id === 'string' ? { tool_use_id: body.tool_use_id } : {}),
         ...(isRecord(body.input) ? { input: body.input } : {}),
+        ...(body.requires_user_interaction === true ? { requires_user_interaction: true } : {}),
         ...(Array.isArray(body.permission_suggestions)
           ? { permission_suggestions: body.permission_suggestions }
           : {}),

@@ -85,6 +85,23 @@ describe('permission card', () => {
     expect(summary(card)).toBe('🔐 需要你的许可');
   });
 
+  it('drops the always button when persistence would break the tool', () => {
+    const card = toolPermissionCard({
+      pending: toolPending({ command: 'echo hi' }),
+      suppressAlways: true,
+    });
+
+    // Two choices, not three: without a suggestion to echo, "always" would
+    // synthesize a saved allow-rule, and permanently allowing a tool whose job
+    // is to ask leaves nobody to answer it.
+    expect(buttonValues(card).map((v) => v.choice)).toEqual(['allow-once', 'deny']);
+    const text = markdown(card);
+    expect(text).not.toContain('始终允许');
+    expect(text).not.toContain('settings.local.json');
+    // The card still has to say what it is waiting for.
+    expect(text).toContain('运行会一直等待');
+  });
+
   it('renames the always button when the CLI only offers a session switch', () => {
     // Exactly what the CLI suggests for a Write in `default` mode: a
     // session-scoped mode change, not a saved rule. Promising "始终" here

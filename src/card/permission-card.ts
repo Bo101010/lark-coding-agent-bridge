@@ -12,18 +12,43 @@ export const HUMAN_INPUT_MARKER = '__bridge_hitl';
 const INPUT_FIELD_MAX = 400;
 const BODY_TOTAL_MAX = 2000;
 
+/**
+ * How a human-in-the-loop card ended.
+ *
+ * A permission card ends in one of the three choices; a question card ends
+ * with the answers themselves, which the frozen card replays so the chat
+ * keeps a readable record of what was decided.
+ */
+export interface SettledState {
+  choice: PermissionChoice | 'withdrawn' | 'answered';
+  /** Present when `choice` is `'answered'`. */
+  answers?: Record<string, string>;
+  operatorName?: string;
+}
+
 export interface PermissionCardOptions {
   pending: PendingHumanInput;
   /** Signs the click so a replayed or forged callback cannot answer. */
   signCallback?: (action: string) => string;
   /** True once a choice has been made — renders a frozen, greyed-out card. */
-  settled?: { choice: PermissionChoice | 'withdrawn'; operatorName?: string };
+  settled?: SettledState;
   /**
    * One-off line explaining a click that was refused, e.g. by someone other
    * than the person who started the run. The question is still open, so the
    * card keeps its live buttons.
    */
   notice?: string;
+  /**
+   * Drop the 「始终允许」 button.
+   *
+   * Set for a `requires_user_interaction` ask whose payload we could not
+   * render as a question card. The CLI's contract forbids a one-tap decision
+   * there, and "always" is worse than forbidden: with no
+   * `permission_suggestions` to echo we would synthesize an allow-rule for
+   * the tool, and permanently allowing `AskUserQuestion` breaks it — the tool
+   * exists to ask, and an auto-allowed call has nobody to answer it.
+   */
+  suppressAlways?: boolean;
 }
 
 /**
@@ -55,11 +80,7 @@ export function toolPermissionCard(options: PermissionCardOptions): object {
   const labelFor = (choice: PermissionChoice, open: string): string =>
     settled?.choice === choice ? settledLabels[choice] : open;
 
-  const title = settled
-    ? settled.choice === 'withdrawn'
-      ? '⏹ 已撤回'
-      : settledLabels[settled.choice]
-    : '🔐 需要你的许可';
+  const title = settledLead(settled, settledLabels, '🔐 需要你的许可');
 
   const elements: object[] = [
     {
@@ -77,14 +98,21 @@ export function toolPermissionCard(options: PermissionCardOptions): object {
     horizontal_spacing: '8px',
     columns: [
       choiceColumn(options, 'allow-once', labelFor('allow-once', '✅ 允许一次'), 'primary'),
-      choiceColumn(options, 'allow-always', labelFor('allow-always', always.label), 'default'),
+      ...(options.suppressAlways
+        ? []
+        : [choiceColumn(options, 'allow-always', labelFor('allow-always', always.label), 'default')]),
       choiceColumn(options, 'deny', labelFor('deny', '🚫 拒绝'), 'danger'),
     ],
   });
 
   const footnote = settled
     ? settledDetail(settled, always)
-    : `「${always.name}」${always.hint}运行会一直等待，直到你做出选择或发送 \`/stop\`。`;
+    : [
+        options.suppressAlways ? '' : `「${always.name}」${always.hint}`,
+        '运行会一直等待，直到你做出选择或发送 `/stop`。',
+      ]
+        .filter(Boolean)
+        .join('');
   if (footnote) elements.push({ tag: 'markdown', text_size: 'notation', content: footnote });
   if (notice) elements.push({ tag: 'markdown', text_size: 'notation', content: notice });
 
@@ -108,11 +136,7 @@ export function dialogFallbackCard(options: PermissionCardOptions): object {
   const labelFor = (choice: PermissionChoice, open: string): string =>
     settled?.choice === choice ? settledLabels[choice] : open;
 
-  const title = settled
-    ? settled.choice === 'withdrawn'
-      ? '⏹ 已撤回'
-      : settledLabels[settled.choice]
-    : '🧑‍⚖️ 需要你的确认';
+  const title = settledLead(settled, settledLabels, '🧑‍⚖️ 需要你的确认');
 
   const elements: object[] = [
     {
@@ -144,13 +168,55 @@ export function dialogFallbackCard(options: PermissionCardOptions): object {
 /**
  * `title` doubles as the card's chat-list summary, so a settled card is
  * identifiable as settled without opening it.
+ *
+ * Exported because the question card is a sibling layout that shares the same
+ * envelope and the same frozen-card conventions.
  */
-function card(elements: object[], title: string): object {
+export function card(elements: object[], title: string): object {
   return {
     schema: '2.0',
     config: { summary: { content: title } },
     body: { elements },
   };
+}
+
+/**
+ * The frozen card's headline. An answered question card has no choice to name,
+ * so callers that cannot render one pass their own label and this falls back
+ * to the open-card title only when nothing was settled at all.
+ */
+export function settledLead(
+  settled: SettledState | undefined,
+  labels: Record<PermissionChoice, string>,
+  open: string,
+): string {
+  if (!settled) return open;
+  if (settled.choice === 'withdrawn') return '⏹ 已撤回';
+  if (settled.choice === 'answered') return '✅ 已回答';
+  return labels[settled.choice];
+}
+
+/**
+ * The callback value a card button carries to answer a parked question.
+ *
+ * Shared by every layout so the marker, the request id and the signature are
+ * produced in exactly one place — a button that forgets the marker would be
+ * forwarded to the agent as a follow-up message instead of released into the
+ * blocked run's stdin.
+ */
+export function humanInputValue(
+  options: PermissionCardOptions,
+  extra: Record<string, unknown>,
+): Record<string, unknown> {
+  const value: Record<string, unknown> = {
+    [HUMAN_INPUT_MARKER]: true,
+    request_id: options.pending.requestId,
+    ...extra,
+  };
+  if (options.signCallback) {
+    value.bridge_token = options.signCallback(`hitl:${options.pending.requestId}`);
+  }
+  return value;
 }
 
 function choiceColumn(
@@ -173,21 +239,12 @@ function choiceButton(
   label: string,
   style: 'primary' | 'danger' | 'default',
 ): object {
-  const value: Record<string, unknown> = {
-    [HUMAN_INPUT_MARKER]: true,
-    request_id: options.pending.requestId,
-    choice,
-  };
-  if (options.signCallback) {
-    value.bridge_token = options.signCallback(`hitl:${options.pending.requestId}`);
-  }
-
   const button: Record<string, unknown> = {
     tag: 'button',
     text: { tag: 'plain_text', content: label },
     type: style,
     width: 'fill',
-    behaviors: [{ type: 'callback', value }],
+    behaviors: [{ type: 'callback', value: humanInputValue(options, { choice }) }],
   };
 
   // A settled card keeps its buttons so it is obvious which question was

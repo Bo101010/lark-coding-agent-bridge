@@ -1,10 +1,17 @@
 import type { LarkChannel } from '@larksuite/channel';
 import type { HumanInputRenderer } from '../agent/human-input/broker';
-import type { HumanInputKind, PendingHumanInput } from '../agent/human-input/types';
+import type { CanUseToolRequest, HumanInputKind, PendingHumanInput } from '../agent/human-input/types';
+import { parseUserQuestions } from '../agent/human-input/user-question';
 import { log } from '../core/logger';
 import { sendManagedCard, updateManagedCard, forgetManagedCard } from './managed';
-import { dialogFallbackCard, toolPermissionCard, type PermissionCardOptions } from './permission-card';
+import {
+  dialogFallbackCard,
+  toolPermissionCard,
+  type PermissionCardOptions,
+  type SettledState,
+} from './permission-card';
 import type { PermissionChoice } from './permission-decision';
+import { userQuestionCard } from './user-question-card';
 
 /**
  * Dialog kinds we have a layout for. The broker turns this into the
@@ -92,13 +99,24 @@ export class LarkHumanInputRenderer implements HumanInputRenderer {
     await this.freeze(pending.requestId, { choice: 'withdrawn' });
   }
 
-  /** Freeze the card after a human chose, so it cannot be clicked again. */
+  /**
+   * Freeze the card after a human answered, so it cannot be clicked again.
+   *
+   * Two shapes because the two kinds of card end differently: a permission
+   * card records *which button* was taken, while a question card has to
+   * replay the answers themselves — "已回答" alone would throw away the only
+   * readable record of what the person chose.
+   */
   async settle(
     requestId: string,
-    choice: PermissionChoice,
+    outcome: { choice: PermissionChoice | 'withdrawn' } | { answers: Record<string, string> },
     operatorName?: string,
   ): Promise<void> {
-    await this.freeze(requestId, { choice, ...(operatorName ? { operatorName } : {}) });
+    const settled: SettledState =
+      'answers' in outcome
+        ? { choice: 'answered', answers: outcome.answers }
+        : { choice: outcome.choice };
+    await this.freeze(requestId, { ...settled, ...(operatorName ? { operatorName } : {}) });
   }
 
   /** The pending question a click refers to, if it is still open. */
@@ -106,10 +124,7 @@ export class LarkHumanInputRenderer implements HumanInputRenderer {
     return this.sent.get(requestId)?.pending;
   }
 
-  private async freeze(
-    requestId: string,
-    settled: { choice: PermissionChoice | 'withdrawn'; operatorName?: string },
-  ): Promise<void> {
+  private async freeze(requestId: string, settled: SettledState): Promise<void> {
     const entry = this.sent.get(requestId);
     if (!entry) {
       log.info('human-input', 'card-freeze-no-entry', { requestId, choice: settled.choice });
@@ -155,8 +170,21 @@ export class LarkHumanInputRenderer implements HumanInputRenderer {
       ? (action: string) => this.deps.signCallback!(pending.scope, action) ?? ''
       : undefined;
     const options: PermissionCardOptions = { pending, ...(signCallback ? { signCallback } : {}), ...extra };
-    return pending.kind === 'can_use_tool'
-      ? toolPermissionCard(options)
-      : dialogFallbackCard(options);
+    const request = pending.request as CanUseToolRequest;
+
+    // `AskUserQuestion` is a tool ask whose payload is the question itself.
+    // Anything we cannot parse still has to be answered — the run is parked —
+    // so it falls back to the permission card: the human can let the tool run
+    // or refuse it. That fallback loses the "always" button, because the CLI
+    // marks these asks `requires_user_interaction` precisely so a one-tap
+    // decision is not offered, and persisting an allow-rule for a tool whose
+    // job is to ask would leave nobody to answer it.
+    const questions = parseUserQuestions(request);
+    if (questions) return userQuestionCard({ ...options, questions });
+
+    if (pending.kind !== 'can_use_tool') return dialogFallbackCard(options);
+    return toolPermissionCard(
+      request.requires_user_interaction ? { ...options, suppressAlways: true } : options,
+    );
   }
 }

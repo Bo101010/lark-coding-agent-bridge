@@ -15,7 +15,14 @@ import type { WorkspaceStore } from '../workspace/store';
 import { commandSessionCatalogIdentity } from '../bot/session-catalog-identity';
 import { lookupMessageThreadId } from '../bot/thread-id';
 import type { HumanInputBroker } from '../agent/human-input/broker';
-import type { CanUseToolRequest } from '../agent/human-input/types';
+import type { CanUseToolRequest, HumanInputAnswer, PendingHumanInput } from '../agent/human-input/types';
+import {
+  buildAnswers,
+  parseUserQuestions,
+  questionDecision,
+  questionDeclinedDecision,
+  type UserQuestion,
+} from '../agent/human-input/user-question';
 import { HUMAN_INPUT_MARKER } from './permission-card';
 import { toolDecisionFor, type PermissionChoice } from './permission-decision';
 import { type LarkHumanInputRenderer } from './human-input-renderer';
@@ -58,12 +65,13 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
   const chatId = deps.evt.chatId;
 
   // CardKit 2.0 form submits drop user-input values from action.value; they
-  // arrive on raw.action.form_value. The SDK forwards the raw event when
-  // includeRawEvent: true is set on the channel options.
+  // arrive separately, keyed by element name. The channel normalizes them onto
+  // `action.formValue`; the raw payload carries the same map as
+  // `action.form_value` and is the fallback for an older channel build.
   const raw = (deps.evt as CardActionEvent & { raw?: unknown }).raw as
     | { action?: { form_value?: Record<string, unknown> } }
     | undefined;
-  const formValue = raw?.action?.form_value;
+  const formValue = deps.evt.action.formValue ?? raw?.action?.form_value;
 
   // Resolve the click's session scope. For topic groups we need to know
   // the message's thread_id so the action targets the right topic's
@@ -93,7 +101,7 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
   // so it must go straight to the broker (and from there to the CLI's
   // stdin) rather than onto the pending queue as a follow-up message.
   if (HUMAN_INPUT_MARKER in payload) {
-    await handleHumanInputAnswer(deps, payload, scope);
+    await handleHumanInputAnswer(deps, payload, scope, formValue);
     return;
   }
 
@@ -185,10 +193,10 @@ async function handleHumanInputAnswer(
   deps: CardDispatchDeps,
   payload: Record<string, unknown>,
   scope: string,
+  formValue: Record<string, unknown> | undefined,
 ): Promise<void> {
   const requestId = typeof payload.request_id === 'string' ? payload.request_id : '';
-  const choice = payload.choice;
-  if (!requestId || !isPermissionChoice(choice)) {
+  if (!requestId) {
     log.warn('cardAction', 'hitl-malformed', { scope });
     return;
   }
@@ -223,28 +231,108 @@ async function handleHumanInputAnswer(
     return;
   }
 
-  const answer =
+  const questions =
     pending.kind === 'can_use_tool'
-      ? toolDecisionFor(pending.request as CanUseToolRequest, choice)
-      : dialogAnswerFor(choice);
+      ? parseUserQuestions(pending.request as CanUseToolRequest)
+      : undefined;
 
-  const delivered = deps.humanInput.answer(requestId, answer);
+  const outcome = questions
+    ? questionOutcome(pending.request as CanUseToolRequest, questions, payload, formValue)
+    : choiceOutcome(pending, payload);
+  if (!outcome) {
+    log.warn('cardAction', 'hitl-malformed', { scope, requestId });
+    return;
+  }
+
+  const delivered = deps.humanInput.answer(requestId, outcome.answer);
   if (!delivered) {
     log.info('cardAction', 'hitl-already-settled', { scope, requestId });
     return;
   }
 
-  log.info('cardAction', 'hitl-answered', { scope, requestId, choice });
+  log.info('cardAction', 'hitl-answered', {
+    scope,
+    requestId,
+    // A question card reports how many questions were answered, not a choice —
+    // the two are different enough that collapsing them would hide which kind
+    // of card was actually live.
+    ...('choice' in outcome.settled
+      ? { choice: outcome.settled.choice }
+      : { answered: Object.keys(outcome.settled.answers).length }),
+  });
   // Detached on purpose. Lark's client keeps the card locked while this
   // handler is pending and restores its cached copy the moment it returns,
   // discarding a repaint made in the meantime — an answered card would then
   // still look unanswered. The renderer waits out the round trip itself; see
   // its `settleDelayMs`.
   void deps.humanInputRenderer
-    ?.settle(requestId, choice, deps.evt.operator.name)
+    ?.settle(requestId, outcome.settled, deps.evt.operator.name)
     .catch((err: unknown) => {
       log.fail('cardAction', err, { step: 'hitl-settle', requestId });
     });
+}
+
+interface HitlOutcome {
+  answer: HumanInputAnswer;
+  settled: { choice: PermissionChoice | 'withdrawn' } | { answers: Record<string, string> };
+}
+
+/** The classic three-button answer: a permission choice, or a dialog verdict. */
+function choiceOutcome(pending: PendingHumanInput, payload: Record<string, unknown>): HitlOutcome | undefined {
+  const choice = payload.choice;
+  if (!isPermissionChoice(choice)) return undefined;
+  return {
+    answer:
+      pending.kind === 'can_use_tool'
+        ? toolDecisionFor(pending.request as CanUseToolRequest, choice)
+        : dialogAnswerFor(choice),
+    settled: { choice },
+  };
+}
+
+/**
+ * The answer to an `AskUserQuestion`, which comes back one of two ways.
+ *
+ * A lone single-select question is answered by tapping an option, so the
+ * whole answer set is known at click time and rides in the button's value. A
+ * form-submitting card sends nothing but the request id — its controls arrive
+ * separately in `formValue`, which is why the questions are read back from
+ * the parked request rather than trusted from the payload.
+ */
+function questionOutcome(
+  request: CanUseToolRequest,
+  questions: readonly UserQuestion[],
+  payload: Record<string, unknown>,
+  formValue: Record<string, unknown> | undefined,
+): HitlOutcome | undefined {
+  // The explicit skip button. Answered as a refusal rather than an empty
+  // answer set: the person said no, and the model should hear that.
+  if (payload.choice === 'deny') {
+    return { answer: questionDeclinedDecision(), settled: { answers: {} } };
+  }
+
+  const fromButton = payloadAnswers(payload);
+  // Otherwise the answers come from the submitted form. It has to have
+  // actually arrived: reading a missing `formValue` as an empty answer set
+  // would report "the human answered nothing" when the truth is that we never
+  // saw what they typed. Leaving the card open and logging it is the honest
+  // failure. An empty form that *was* submitted is different — that is a real
+  // "nothing to add", and `buildAnswers` returns an empty record for it.
+  if (!fromButton && !formValue) return undefined;
+
+  const answers = fromButton ?? buildAnswers(questions, formValue ?? {});
+  return { answer: questionDecision(request, answers), settled: { answers } };
+}
+
+/** The answers a one-tap button carried, if it carried well-formed ones. */
+function payloadAnswers(payload: Record<string, unknown>): Record<string, string> | undefined {
+  const raw = payload.answers;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const answers: Record<string, string> = {};
+  for (const [question, answer] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof answer === 'string') answers[question] = answer;
+  }
+  return answers;
 }
 
 /**

@@ -34,6 +34,13 @@ export interface CanUseToolRequest {
   tool_use_id?: string;
   input?: Record<string, unknown>;
   /**
+   * The CLI's marker that this is not a yes/no gate: the approval card IS the
+   * interaction surface, and one-tap Approve/Deny must not be offered. Set for
+   * `AskUserQuestion` (whose input carries the questions to render) and for
+   * asks whose consent disclosure only the local terminal can display.
+   */
+  requires_user_interaction?: boolean;
+  /**
    * Pre-built permission rules the CLI suggests for an "always allow" style
    * answer. Passing one back verbatim in `updatedPermissions` is far safer
    * than synthesizing rule content ourselves — the CLI owns that grammar.

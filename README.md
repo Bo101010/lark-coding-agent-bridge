@@ -348,6 +348,25 @@ It is off by default because it changes how runs behave: with `workspace` access
 
 The same channel carries every blocking question the CLI raises, not just tool permissions. The bridge declares which dialog kinds it can render during the handshake; anything it cannot render is never sent, and that flow falls back to the CLI's own no-dialog behavior.
 
+### Asking you directly (options, multi-select, free text)
+
+The same channel also carries questions the *agent* raises. Claude Code's `AskUserQuestion` renders as a **question card** rather than a permission card — the bridge's system prompt tells the agent to reach for it whenever it needs a choice from you, instead of hand-rolling a card.
+
+| Question type | Control on the card |
+|---|---|
+| Single-select (`choice`, the default) | One button per option — one tap is the answer. Several questions on one card degrade to a dropdown plus submit |
+| Multi-select (`multiSelect: true`) | One checkbox per option, then **Submit** |
+| Text (`type: "text"`) | A text box |
+| Number (`type: "number"`) | A text box, with the `min ~ max` range shown on the card |
+
+Every card also carries an "other" box for whatever you want to type — it wins over the dropdown for a single answer, and joins the list as one more entry for a multi-select. One card can ask several questions at once; you submit them together.
+
+The answers come back into the tool call as `answers` (question text → answer string), so the agent carries straight on instead of waiting for another message from you. A multi-select answer is its labels joined with `, `.
+
+Each card also offers **Skip**: tapping it declines the tool call, and the agent should take that as a no and ask differently or proceed with a default rather than re-asking. Submitting a blank form is an empty answer set, not a refusal.
+
+An answered card freezes into a record — each question with the answer it got (or `_未回答_` for the ones left blank), plus who answered — so the chat keeps something to look back at.
+
 ## Data directories
 
 | Path | Content |

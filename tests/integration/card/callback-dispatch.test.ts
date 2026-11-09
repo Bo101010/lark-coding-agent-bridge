@@ -133,7 +133,7 @@ describe('human-in-the-loop card answers', () => {
 
     expect(h.hitl.answered).toEqual([{ requestId: 'req-1', answer: { behavior: 'allow' } }]);
     expect(h.hitl.settled).toEqual([
-      { requestId: 'req-1', choice: 'allow-once', operatorName: 'Operator' },
+      { requestId: 'req-1', outcome: { choice: 'allow-once' }, operatorName: 'Operator' },
     ]);
     expect(h.hitl.notices).toEqual([]);
   });
@@ -192,7 +192,7 @@ type Harness = {
 /** Records what the dispatcher did with a parked question. */
 type HitlSpy = {
   answered: Array<{ requestId: string; answer: unknown }>;
-  settled: Array<{ requestId: string; choice: string; operatorName?: string }>;
+  settled: Array<{ requestId: string; outcome: unknown; operatorName?: string }>;
   notices: Array<{ requestId: string; text: string }>;
 };
 
@@ -266,8 +266,8 @@ async function createHarness(
             askedAt: 1000,
           }
         : undefined,
-    settle: async (requestId: string, choice: string, operatorName?: string) => {
-      hitl.settled.push({ requestId, choice, ...(operatorName ? { operatorName } : {}) });
+    settle: async (requestId: string, outcome: unknown, operatorName?: string) => {
+      hitl.settled.push({ requestId, outcome, ...(operatorName ? { operatorName } : {}) });
     },
     notice: async (requestId: string, text: string) => {
       hitl.notices.push({ requestId, text });
